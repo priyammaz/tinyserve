@@ -1,7 +1,7 @@
 # tinyserve
 <img src="banner.png" alt="img" width="700"/>
 
-LLM inference is all the rage these days! Whether is user side inference or for RL rollout generation during post-training, being able to serve LLMs is extremely important. We create here a single file `serve.py` that implements all the core parts of popular serving platforms like vLLM!
+LLM inference is all the rage these days! Whether its user side inference or for RL rollout generation during post-training, being able to serve LLMs at scale is extremely important. We create here a single file `serve.py` that implements all the core parts of popular serving platforms like vLLM!
 
 It implements, from scratch, the core pieces that make modern LLM serving
 fast:
