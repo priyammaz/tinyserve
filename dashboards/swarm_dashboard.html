@@ -1,0 +1,537 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinyserve swarm</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0b0e14; --panel:#11151c; --border:#232936; --text:#d8dee9; --dim:#6b7685;
+    --live:#4fd1a5; --done:#5b8cff; --accent:#f5a623; --cached:#caa23a; --err:#e06c75; --tester:#b48ead;
+    --code-bg:#161b25;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size:13px; }
+  header { padding:12px 20px; border-bottom:1px solid var(--border);
+           display:flex; align-items:baseline; gap:18px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  .stat, .dim { color:var(--dim); }
+  .stat b { color:var(--text); }
+  .stat b.good { color:var(--live); }
+
+  section, .box { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  #server-box { margin:10px 14px; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px 0; font-weight:600; }
+  .row { display:flex; gap:22px; flex-wrap:wrap; align-items:center; }
+  .bar-item { display:flex; flex-direction:column; gap:4px; min-width:170px; }
+  .bar-label { font-size:11px; color:var(--dim); display:flex; justify-content:space-between; gap:8px; }
+  .bar-track { height:6px; border-radius:3px; background:#1c2230; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:3px; background:var(--live); transition:width .2s; }
+  .bar-fill.kv { background:var(--accent); }
+  .bar-fill.hit { background:var(--cached); }
+  .bar-fill.prog { background:var(--done); }
+
+  /* layout: problem list on the left, the selected problem on the right */
+  #main { display:grid; grid-template-columns: 300px minmax(0, 1fr); gap:10px; margin:10px 14px; align-items:start; }
+  @media (max-width: 900px) { #main { grid-template-columns: minmax(0, 1fr); } }
+  #sidebar { position:sticky; top:10px; max-height:calc(100vh - 20px); display:flex; flex-direction:column; }
+  #plist { overflow-y:auto; margin-top:8px; display:flex; flex-direction:column; gap:4px; }
+  .pitem { padding:7px 9px; border-radius:6px; border:1px solid transparent; cursor:pointer; }
+  .pitem:hover { background:#161b25; }
+  .pitem.sel { border-color:var(--done); background:#141a26; }
+  .pitem.static { cursor:default; }
+  .pitem .psub { color:var(--dim); font-size:11px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .vb { font-size:10px; font-weight:700; padding:1px 5px; border-radius:3px; margin-left:6px; }
+  .vb.pass { color:var(--live); background:rgba(79,209,165,.12); }
+  .vb.fail { color:var(--err); background:rgba(224,108,117,.12); }
+  .vb.live { color:var(--accent); background:rgba(245,166,35,.12); }
+
+  /* syntax highlighting */
+  pre.code { background:var(--code-bg); border-left:2px solid var(--done); margin:6px 0; padding:8px 10px;
+             border-radius:3px; white-space:pre-wrap; word-break:break-word; font-size:12px; color:#c8d3f5; }
+  .kw { color:#c792ea; } .st { color:#c3e88d; } .cm { color:#6b7685; font-style:italic; } .nu { color:#f78c6c; }
+  pre.obs { background:#0f131a; margin:4px 0; padding:6px 10px; border-radius:3px; white-space:pre-wrap;
+            word-break:break-word; font-size:11.5px; color:var(--dim); }
+  pre.obs.err { color:var(--err); }
+  .thought { white-space:pre-wrap; }
+  .think { white-space:pre-wrap; color:var(--dim); font-style:italic; }
+  details > summary { cursor:pointer; color:var(--dim); user-select:none; margin:6px 0; }
+
+  /* live view */
+  #problem-box { display:none; margin-bottom:10px; }
+  .prob { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  .pstatus { font-weight:600; }
+  .pstatus.pass { color:var(--live); } .pstatus.fail { color:var(--err); }
+  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap:10px; }
+  .panel { background:var(--panel); border:2px solid var(--border); border-radius:8px;
+           display:flex; flex-direction:column; height:400px; overflow:hidden; transition:border-color .25s, opacity .25s; }
+  .panel.idle { opacity:.35; }
+  .panel.pass { border-color:var(--live); }
+  .panel.fail { border-color:var(--err); }
+  .panel.finished { border-color:var(--done); }
+  .panel .bar { display:flex; align-items:center; justify-content:space-between; gap:8px;
+                padding:6px 10px; border-bottom:1px solid var(--border); font-size:11px; color:var(--dim); }
+  .panel .bar b { color:var(--text); }
+  .panel .dot { width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px; background:var(--dim); }
+  .panel.generating .dot { background:var(--live); animation:pulse 1s infinite; }
+  .panel.running .dot { background:var(--accent); }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .panel .status { font-weight:600; }
+  .panel.generating .status { color:var(--live); }
+  .panel.running .status { color:var(--accent); }
+  .panel.pass .status { color:var(--live); }
+  .panel.fail .status { color:var(--err); }
+  .panel.finished .status { color:var(--done); }
+  .chosen-tag { color:var(--done); font-weight:600; margin-left:6px; }
+  .panel .title { padding:6px 10px; color:var(--accent); font-size:11px; border-bottom:1px solid var(--border);
+                  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .panel .output { flex:1; padding:8px 10px; overflow-y:auto; line-height:1.4; word-break:break-word; }
+  .panel.idle .output::before { content:'waiting...'; color:var(--dim); font-style:italic; }
+  .panel .obs { max-height:84px; overflow-y:auto; padding:6px 10px; border-top:1px solid var(--border);
+                font-size:11.5px; white-space:pre-wrap; color:var(--dim); }
+  .panel .obs:empty { display:none; }
+  .panel .obs.err { color:var(--err); background:rgba(224,108,117,.06); }
+  .panel .foot { display:flex; justify-content:space-between; align-items:center; gap:8px;
+                 padding:6px 10px; border-top:1px solid var(--border); font-size:11px; color:var(--dim); }
+  .panel .foot b { color:var(--text); }
+  .steps { display:flex; gap:4px; align-items:center; }
+  .sd { width:9px; height:9px; border-radius:50%; background:var(--live); }
+  .sd.err { background:var(--err); } .sd.final { background:var(--done); }
+  .sd.now { background:none; border:1px solid var(--dim); }
+
+  /* judge grid */
+  .judge { overflow-x:auto; }
+  .judge table { border-collapse:collapse; font-size:11px; }
+  .judge td { padding:2px 8px 2px 0; white-space:nowrap; color:var(--dim); }
+  .judge td.who { color:var(--text); }
+  .judge tr.chosen td.who { color:var(--done); font-weight:600; }
+  .cells { display:flex; gap:2px; }
+  .c { width:10px; height:10px; border-radius:2px; background:var(--err); cursor:help; }
+  .c.ok { background:var(--live); }
+  .hid.ok { color:var(--live); font-weight:600; } .hid.bad { color:var(--err); font-weight:600; }
+  .note { color:var(--dim); margin-top:6px; font-size:11px; }
+
+  /* detail view of a finished problem */
+  #detail-view h3 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim);
+                    margin:18px 0 6px; font-weight:600; }
+  .dhead { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; font-size:14px; }
+  .verdict { font-weight:700; }
+  .verdict.pass { color:var(--live); } .verdict.fail { color:var(--err); }
+  .acard { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--border);
+           border-radius:8px; margin-bottom:10px; }
+  .acard.pass { border-left-color:var(--live); } .acard.fail { border-left-color:var(--err); }
+  .acard.tester { border-left-color:var(--tester); }
+  .ahead { padding:8px 10px; display:flex; gap:12px; flex-wrap:wrap; align-items:baseline; border-bottom:1px solid var(--border); }
+  .ast.pass { color:var(--live); } .ast.fail { color:var(--err); } .ast.tester { color:var(--tester); }
+  .abody { padding:4px 10px 8px; }
+  .tstep { border-top:1px dashed var(--border); padding:8px 0; }
+  .tstep .meta { font-size:11px; color:var(--dim); margin-bottom:4px; }
+  .errc { color:var(--err); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>tinyserve &middot; agent swarm</h1>
+  <span class="stat" id="h-model">-</span>
+  <span class="stat">solved <b id="h-done">0</b>/<b id="h-total">0</b></span>
+  <span class="stat">passed <b class="good" id="h-pass">0</b> (<b id="h-rate">-</b>)</span>
+  <span class="stat team-only" style="display:none">single coder <b id="h-single">-</b></span>
+  <span class="stat team-only" style="display:none">any coder right <b id="h-oracle">-</b></span>
+  <span class="stat live-only">LLM calls <b id="h-calls">0</b></span>
+  <span class="stat live-only">output <b id="h-tps">-</b> tok/s</span>
+  <span class="stat live-only">ttft p50 <b id="h-ttft">-</b></span>
+</header>
+
+<section id="server-box">
+  <h2>server</h2>
+  <div class="row">
+    <div class="bar-item">
+      <div class="bar-label"><span>tokens / step budget</span><span id="tok-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill" id="tok-fill" style="width:0%"></div></div>
+    </div>
+    <div class="bar-item">
+      <div class="bar-label"><span>kv cache used</span><span id="kv-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill kv" id="kv-fill" style="width:0%"></div></div>
+    </div>
+    <div class="bar-item">
+      <div class="bar-label"><span>prefix cache hit rate</span><span id="hit-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill hit" id="hit-fill" style="width:0%"></div></div>
+    </div>
+    <span class="stat">running <b id="s-running">-</b></span>
+    <span class="stat">waiting <b id="s-waiting">-</b></span>
+  </div>
+</section>
+
+<div id="main">
+  <aside id="sidebar" class="box">
+    <h2>problems <span id="prog-label" style="float:right"></span></h2>
+    <div class="bar-track"><div class="bar-fill prog" id="prog-fill" style="width:0%"></div></div>
+    <div id="plist"></div>
+  </aside>
+
+  <div id="content">
+    <div id="live-view">
+      <section id="problem-box">
+        <h2>live problem</h2>
+        <div class="prob"><b id="p-name">-</b><span class="pstatus" id="p-status"></span></div>
+        <details id="p-prompt-wrap"><summary>problem statement</summary><pre class="code" id="p-prompt"></pre></details>
+        <div class="judge" id="judge"></div>
+      </section>
+      <div id="grid"></div>
+    </div>
+    <div id="detail-view" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const fmt = (x, d = 2) => (x === null || x === undefined) ? '-' : x.toFixed(d);
+
+// tiny Python highlighter: tokenize the raw text, escape every piece
+const PY = /(#[^\n]*)|("""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?)|\b(def|return|if|elif|else|for|while|in|not|and|or|import|from|as|class|try|except|finally|with|lambda|yield|None|True|False|assert|break|continue|pass|raise|is|global|nonlocal|del)\b|\b(\d+(?:\.\d+)?)\b/g;
+function hl(code) {
+  code = String(code ?? '');
+  let out = '', last = 0, m;
+  PY.lastIndex = 0;
+  while ((m = PY.exec(code)) !== null) {
+    if (m[0] === '') { PY.lastIndex++; continue; }
+    const cls = m[1] ? 'cm' : m[2] ? 'st' : m[3] ? 'kw' : 'nu';
+    out += esc(code.slice(last, m.index)) + `<span class="${cls}">${esc(m[0])}</span>`;
+    last = PY.lastIndex;
+  }
+  return out + esc(code.slice(last));
+}
+
+// "Thought: ... <code> ... </code>" -> its parts (the server stops right before
+// "</code>", a stop string, so the closing tag is usually absent)
+function splitOutput(text) {
+  let think = null;
+  const t = text.match(/<think>([\s\S]*?)(<\/think>|$)/);
+  if (t) { think = t[1].trim(); text = text.replace(/<think>[\s\S]*?(<\/think>|$)/, ''); }
+  let thought = text, code = null;
+  const i = text.indexOf('<code>');
+  if (i >= 0) { thought = text.slice(0, i); code = text.slice(i + 6).replace(/<\/code>\s*$/, ''); }
+  else {
+    const f = text.indexOf('```');
+    if (f >= 0) { thought = text.slice(0, f); code = text.slice(f).replace(/^```\w*\n?/, '').replace(/```\s*$/, ''); }
+  }
+  return { think, thought: thought.replace(/^\s*Thought:\s*/, '').trim(), code: code === null ? null : code.replace(/^\n+/, '') };
+}
+function renderOutput(text) {
+  const { think, thought, code } = splitOutput(text);
+  return (think ? `<div class="think">${esc(think)}</div>` : '') +
+         (thought ? `<div class="thought">${esc(thought)}</div>` : '') +
+         (code !== null ? `<pre class="code">${hl(code)}</pre>` : '');
+}
+
+/* ---------- state ---------- */
+let panels = [], roles = null, review = false;
+let records = [];          // finished problems (team mode), in order
+let simpleResults = [];    // gsm8k mode: one line per finished problem
+let live = null;           // the problem being solved right now (team mode)
+let selected = 'live';     // 'live' or an index into records
+let total = 0, calls = 0, outTokens = 0, t0 = null, ttfts = [];
+
+/* ---------- live panels ---------- */
+function makePanel(i) {
+  const el = document.createElement('div');
+  el.className = 'panel idle';
+  el.innerHTML = `
+    <div class="bar"><span><span class="dot"></span>${esc(roles ? roles[i] : 'agent ' + i)} &middot; <b class="task">-</b> <span class="stepno"></span></span>
+      <span class="status">idle</span></div>
+    <div class="title"></div>
+    <div class="output"></div>
+    <div class="obs"></div>
+    <div class="foot"><span class="steps"></span><span class="metrics"></span></div>`;
+  $('grid').appendChild(el);
+  return { el, text: '', steps: 0, pending: false, q: sel => el.querySelector(sel) };
+}
+function setStatus(p, cls, label) {
+  p.el.classList.remove('idle', 'generating', 'running', 'pass', 'fail', 'finished');
+  if (cls) p.el.classList.add(cls);
+  p.q('.status').textContent = label;
+}
+function resetPanel(p) {
+  p.text = ''; p.steps = 0;
+  ['.task', '.stepno', '.title'].forEach(s => p.q(s).textContent = s === '.task' ? '-' : '');
+  p.q('.output').innerHTML = ''; p.q('.steps').innerHTML = ''; p.q('.metrics').innerHTML = '';
+  p.q('.obs').textContent = ''; p.q('.obs').className = 'obs';
+  const tag = p.q('.chosen-tag'); if (tag) tag.remove();
+  setStatus(p, 'idle', 'idle');
+}
+function scheduleRender(p) {
+  if (p.pending) return;
+  p.pending = true;
+  requestAnimationFrame(() => {
+    p.pending = false;
+    const out = p.q('.output');
+    out.innerHTML = renderOutput(p.text);
+    out.scrollTop = out.scrollHeight;
+  });
+}
+function addStepDot(p, cls) {
+  const now = p.q('.sd.now'); if (now) now.remove();
+  const d = document.createElement('span'); d.className = 'sd ' + cls; p.q('.steps').appendChild(d);
+}
+
+/* ---------- judge grid (live and detail) ---------- */
+function judgeTable(m) {
+  const rows = m.cands.map((name, c) => {
+    const row = m.matrix[c];
+    const group = m.groups.findIndex(g => g.includes(c));
+    const cells = row === null ? '<span class="dim">no candidate</span>'
+      : `<div class="cells">${row.map((ok, t) => `<span class="c ${ok ? 'ok' : ''}" title="${
+          esc((m.test_sources ? m.test_sources[t] + ': ' : '') + m.tests[t])}"></span>`).join('')}</div>`;
+    return `<tr class="${c === m.chosen ? 'chosen' : ''}">
+      <td class="who">${esc(name)}${c === m.chosen ? ' ◀ submitted' : ''}</td><td>${cells}</td>
+      <td>${row ? row.filter(Boolean).length + '/' + row.length : ''}</td>
+      <td>${group >= 0 ? `group ${group + 1} (${m.groups[group].length})` : ''}</td>
+      <td class="hid ${m.hidden[c] ? 'ok' : 'bad'}">${row === null ? '' : (m.hidden[c] ? 'hidden tests pass' : 'hidden tests fail')}</td></tr>`;
+  }).join('');
+  return `<table>${rows}</table><div class="note">${m.tests.length} tests (docstring examples + testers; hover a square).
+    Candidates passing exactly the same tests form a group; the team submits from the group with the
+    highest size x tests passed (CodeT).</div>`;
+}
+function renderLiveJudge(m) {
+  $('judge').innerHTML = judgeTable(m);
+  $('p-status').textContent = m.correct ? 'team PASS' : 'team FAIL';
+  $('p-status').className = 'pstatus ' + (m.correct ? 'pass' : 'fail');
+  m.cands.forEach((_, c) => {
+    const p = panels[c];
+    if (!p || m.matrix[c] === null) return;
+    setStatus(p, m.hidden[c] ? 'pass' : 'fail', m.hidden[c] ? 'correct' : 'wrong');
+    if (c === m.chosen) {
+      const tag = document.createElement('span');
+      tag.className = 'chosen-tag'; tag.textContent = 'submitted';
+      p.q('.bar span').appendChild(tag);
+    }
+  });
+}
+
+/* ---------- detail view of a finished problem ---------- */
+function stepBlock(s) {
+  const { think, thought, code } = splitOutput(s.output || '');
+  const usage = s.prompt ? ` &middot; prompt ${s.prompt} tok (${Math.round(100 * (s.cached || 0) / s.prompt)}% cached)` +
+                           ` &middot; ${s.completion} out &middot; ${s.seconds}s` : '';
+  return `<div class="tstep">
+    <div class="meta">step ${s.step}${s.final ? ' &middot; final answer' : ''}${s.error ? ' &middot; <span class="errc">error</span>' : ''}${usage}</div>
+    ${think ? `<div class="think">${esc(think)}</div>` : ''}
+    ${thought ? `<div class="thought">${esc(thought)}</div>` : ''}
+    ${code !== null ? `<pre class="code">${hl(code)}</pre>` : ''}
+    ${s.observation ? `<pre class="obs ${s.error ? 'err' : ''}">${esc(s.observation)}</pre>` : ''}</div>`;
+}
+function agentCard(a, kind, chosen) {
+  const steps = a.steps || [];
+  const retried = steps.filter(s => s.error).length;
+  const tokens = steps.reduce((n, s) => n + (s.completion || 0), 0);
+  let cls, status, body;
+  if (kind === 'coder') {
+    cls = a.code !== null && a.hidden ? 'pass' : 'fail';
+    status = a.code === null ? esc(a.note) : (a.hidden ? 'correct on the hidden tests' : 'wrong: ' + esc(a.hidden_error || ''));
+    body = a.code !== null ? `<pre class="code">${hl(a.code)}</pre>` : '';
+  } else {
+    cls = 'tester'; status = esc(a.note);
+    body = a.tests.length ? `<pre class="code">${hl(a.tests.join('\n'))}</pre>` : '';
+  }
+  const meta = kind === 'coder' ? `${esc(a.strategy)} &middot; temperature ${a.temperature}`
+    : `sees only the docstring &middot; ${a.temperature == null ? 'recommended sampling' : 'temperature ' + a.temperature}`;
+  return `<div class="acard ${cls}">
+    <div class="ahead"><b>${esc(a.role)}</b>${chosen ? '<span class="chosen-tag">submitted</span>' : ''}
+      <span class="dim">${meta}</span><span class="ast ${cls}">${status}</span>
+      <span class="dim">${steps.length} steps (${retried} retried) &middot; ${tokens} tokens &middot; ${a.seconds}s</span></div>
+    <div class="abody">${body}
+      <details><summary>transcript: ${steps.length} steps</summary>${steps.map(stepBlock).join('')}</details></div></div>`;
+}
+function renderDetail(r) {
+  const right = r.hidden.filter(Boolean).length;
+  const who = r.chosen !== null && r.chosen !== undefined ? r.cands[r.chosen] : null;
+  return `<section>
+    <div class="dhead"><b>#${r.index + 1} ${esc(r.name)}</b>
+      <span class="verdict ${r.correct ? 'pass' : 'fail'}">team ${r.correct ? 'PASS' : 'FAIL'}</span>
+      <span class="dim">${who ? 'submitted ' + esc(who) : 'nothing submitted'} &middot; coders right ${right}/${r.hidden.length}
+        &middot; ${r.tests.length} tests &middot; ${r.seconds}s</span></div>
+    <h3>problem</h3><pre class="code">${hl(r.prompt)}</pre>
+    <h3>submitted solution${who ? ' (' + esc(who) + ')' : ''}</h3>
+    ${r.submitted ? `<pre class="code">${hl(r.submitted)}</pre>` : '<div class="dim">no candidate was submitted</div>'}
+    <details><summary>HumanEval reference solution and hidden tests</summary>
+      <pre class="code">${hl(r.reference)}</pre><pre class="code">${hl(r.hidden_test)}</pre></details>
+    <h3>judge</h3><div class="judge">${judgeTable(r)}</div>
+    <h3>agents</h3>
+    ${r.coders.map((c, i) => agentCard(c, 'coder', i === r.chosen)).join('')}
+    ${r.testers.map(t => agentCard(t, 'tester', false)).join('')}
+  </section>`;
+}
+
+/* ---------- sidebar + switching views ---------- */
+function renderSidebar() {
+  const items = [];
+  const liveOpen = live && !records.some(r => r.index === live.index);
+  if (liveOpen) {
+    items.push(`<div class="pitem ${selected === 'live' ? 'sel' : ''}" data-sel="live">
+      <b>#${live.index + 1} ${esc(live.name)}</b><span class="vb live">LIVE</span>
+      <div class="psub">${esc(live.title)}</div></div>`);
+  }
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i], right = r.hidden.filter(Boolean).length;
+    items.push(`<div class="pitem ${selected === i ? 'sel' : ''}" data-sel="${i}">
+      <b>#${r.index + 1} ${esc(r.name)}</b><span class="vb ${r.correct ? 'pass' : 'fail'}">${r.correct ? 'PASS' : 'FAIL'}</span>
+      <div class="psub">coders right ${right}/${r.hidden.length} &middot; ${r.tests.length} tests &middot; ${r.seconds}s</div></div>`);
+  }
+  for (let i = simpleResults.length - 1; i >= 0; i--) {
+    const r = simpleResults[i];
+    items.push(`<div class="pitem static"><b>${esc(r.name)}</b><span class="vb ${r.correct ? 'pass' : 'fail'}">${r.correct ? 'PASS' : 'FAIL'}</span>
+      <div class="psub">${r.steps} steps &middot; ${fmt(r.seconds, 1)}s ${esc(r.why || r.error || '')}</div></div>`);
+  }
+  $('plist').innerHTML = items.join('') || '<div class="dim">nothing yet</div>';
+}
+$('plist').addEventListener('click', e => {
+  const it = e.target.closest('.pitem');
+  if (!it || it.dataset.sel === undefined) return;
+  select(it.dataset.sel === 'live' ? 'live' : Number(it.dataset.sel));
+});
+function select(sel) {
+  selected = sel;
+  const showLive = sel === 'live';
+  $('live-view').style.display = showLive ? '' : 'none';
+  $('detail-view').style.display = showLive ? 'none' : '';
+  if (!showLive && records[sel]) { $('detail-view').innerHTML = renderDetail(records[sel]); window.scrollTo(0, 0); }
+  renderSidebar();
+}
+
+/* ---------- header ---------- */
+function updateHeader() {
+  const done = records.length + simpleResults.length;
+  const passed = records.filter(r => r.correct).length + simpleResults.filter(r => r.correct).length;
+  $('h-done').textContent = done;
+  $('h-total').textContent = total;
+  $('h-pass').textContent = passed;
+  $('h-rate').textContent = done ? (100 * passed / done).toFixed(1) + '%' : '-';
+  $('h-calls').textContent = calls;
+  if (t0 && outTokens) $('h-tps').textContent = Math.round(outTokens / ((performance.now() - t0) / 1000));
+  if (ttfts.length) { const s = [...ttfts].sort((a, b) => a - b); $('h-ttft').textContent = fmt(s[Math.floor(s.length / 2)]) + 's'; }
+  $('prog-label').textContent = `${done} / ${total}`;
+  $('prog-fill').style.width = total ? (100 * done / total) + '%' : '0%';
+  if (records.length) {
+    const single = records.reduce((n, r) => n + r.hidden.filter(Boolean).length / r.hidden.length, 0) / records.length;
+    const oracle = records.filter(r => r.hidden.some(Boolean)).length / records.length;
+    $('h-single').textContent = (100 * single).toFixed(1) + '%';
+    $('h-oracle').textContent = (100 * oracle).toFixed(1) + '%';
+  }
+}
+function onStats(d) {
+  if (d.max_num_batched_tokens) {
+    $('tok-label').textContent = `${d.tokens_last_step} / ${d.max_num_batched_tokens}`;
+    $('tok-fill').style.width = (100 * d.tokens_last_step / d.max_num_batched_tokens) + '%';
+  }
+  if (d.total_kv_blocks) {
+    const used = d.total_kv_blocks - d.free_kv_blocks;
+    $('kv-label').textContent = (100 * used / d.total_kv_blocks).toFixed(1) + '%';
+    $('kv-fill').style.width = (100 * used / d.total_kv_blocks) + '%';
+  }
+  if (d.total_prompt_tokens) {
+    const hit = 100 * d.total_cached_tokens / d.total_prompt_tokens;
+    $('hit-label').textContent = hit.toFixed(1) + '%';
+    $('hit-fill').style.width = hit + '%';
+  }
+  $('s-running').textContent = d.running ?? '-';
+  $('s-waiting').textContent = d.waiting ?? '-';
+}
+
+/* ---------- messages ---------- */
+function handle(m) {
+  switch (m.type) {
+    case 'stats': return onStats(m.data || {});
+    case 'init':
+      roles = m.roles && m.roles.length ? m.roles : null;
+      review = !!m.review;
+      records = []; simpleResults = []; live = null; calls = outTokens = 0; ttfts = []; t0 = performance.now();
+      total = m.total;
+      $('grid').innerHTML = '';
+      panels = Array.from({ length: m.slots }, (_, i) => makePanel(i));
+      $('h-model').textContent = `${m.model} · ${m.workload}`;
+      $('server-box').style.display = review ? 'none' : '';
+      $('problem-box').style.display = roles ? 'block' : 'none';
+      document.querySelectorAll('.team-only').forEach(e => e.style.display = (roles || review) ? '' : 'none');
+      document.querySelectorAll('.live-only').forEach(e => e.style.display = review ? 'none' : '');
+      select(review ? -1 : 'live');
+      return updateHeader();
+    case 'problem':
+      live = m;
+      panels.forEach(resetPanel);
+      $('p-name').textContent = `#${m.index + 1}  ${m.name}`;
+      $('p-status').textContent = 'team working'; $('p-status').className = 'pstatus';
+      $('p-prompt').innerHTML = hl(m.prompt || m.title || '');
+      $('judge').innerHTML = '';
+      return renderSidebar();
+    case 'judge': return renderLiveJudge(m);
+    case 'record':
+      records.push(m);
+      if (review && (selected === 'live' || selected === -1)) select(0); else renderSidebar();
+      return updateHeader();
+  }
+  const p = panels[m.slot];
+  if (m.type === 'result' && m.slot !== undefined) {  // independent-agents mode (gsm8k)
+    simpleResults.push(m); renderSidebar(); updateHeader();
+  }
+  if (!p) return;
+  switch (m.type) {
+    case 'task':
+      resetPanel(p);
+      p.q('.task').textContent = m.name;
+      p.q('.title').textContent = m.title || ''; p.q('.title').title = m.title || '';
+      setStatus(p, 'generating', 'starting');
+      break;
+    case 'llm_start':
+      p.text = ''; p.steps++;
+      p.q('.stepno').textContent = `step ${p.steps}`;
+      addStepDot(p, 'now');
+      setStatus(p, 'generating', 'generating');
+      scheduleRender(p);
+      break;
+    case 'delta':
+      p.text += m.text;
+      scheduleRender(p);
+      break;
+    case 'llm_end': {
+      calls++; outTokens += m.completion;
+      if (m.ttft !== null && m.ttft !== undefined) { ttfts.push(m.ttft); if (ttfts.length > 500) ttfts.shift(); }
+      const gen = Math.max(m.latency - (m.ttft || 0), 1e-3);
+      const hit = m.prompt ? Math.round(100 * m.cached / m.prompt) : 0;
+      p.q('.metrics').innerHTML = `ttft <b>${fmt(m.ttft)}s</b> &middot; prompt <b>${m.prompt.toLocaleString()}</b> (${hit}% cached) ` +
+        `&middot; <b>${m.completion}</b> tok &middot; <b>${(m.completion / gen).toFixed(0)}</b> tok/s`;
+      setStatus(p, 'running', 'running code');
+      updateHeader();
+      break;
+    }
+    case 'step': {
+      addStepDot(p, m.final ? 'final' : (m.error ? 'err' : ''));
+      const obs = p.q('.obs');
+      obs.textContent = m.observation.trim();
+      obs.className = 'obs' + (m.error ? ' err' : '');
+      obs.scrollTop = obs.scrollHeight;
+      if (m.final) setStatus(p, 'running', 'submitting');
+      break;
+    }
+    case 'agent_done':
+      setStatus(p, 'finished', m.summary);
+      break;
+    case 'result':
+      setStatus(p, m.correct ? 'pass' : 'fail', m.correct ? 'PASS' : (m.error ? 'ERROR' : 'FAIL'));
+      break;
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+connect();
+setInterval(updateHeader, 1000);
+</script>
+</body>
+</html>

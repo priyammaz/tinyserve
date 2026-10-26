@@ -1,0 +1,369 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>tinyserve live</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0b0e14; --panel:#11151c; --border:#232936; --text:#d8dee9; --dim:#6b7685;
+    --live:#4fd1a5; --done:#5b8cff; --accent:#f5a623;
+    --cached:#caa23a;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size:13px; }
+  header { padding:12px 20px; border-bottom:1px solid var(--border);
+           display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.02em; }
+  header .stat { color:var(--dim); }
+  header .stat b { color:var(--text); }
+
+  section { margin:10px 14px; }
+  .box { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .box h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim);
+            margin:0 0 8px 0; font-weight:600; }
+
+  .bars { display:flex; gap:22px; flex-wrap:wrap; align-items:center; }
+  .bar-item { display:flex; flex-direction:column; gap:4px; min-width:170px; }
+  .bar-label { font-size:11px; color:var(--dim); display:flex; justify-content:space-between; gap:8px; }
+  .bar-track { height:6px; border-radius:3px; background:#1c2230; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:3px; background:var(--live); transition:width .2s; }
+  .bar-fill.kv { background:var(--accent); }
+  .bar-fill.hit { background:var(--cached); }
+
+
+  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+          gap:10px; }
+  .panel { background:var(--panel); border:2px solid var(--border); border-radius:8px;
+           display:flex; flex-direction:column; height:230px; overflow:hidden;
+           transition:border-color .2s, opacity .3s, transform .3s; }
+  .panel.idle { opacity:.35; }
+  .panel.done { opacity:.75; }
+  .panel.fading { opacity:0; transform:scale(.96); }
+  .panel .bar { display:flex; align-items:center; justify-content:space-between;
+                padding:6px 10px; border-bottom:1px solid var(--border); font-size:11px; color:var(--dim); }
+  .panel .dot { width:7px; height:7px; border-radius:50%; display:inline-block;
+                margin-right:6px; background:var(--dim); }
+  .panel.live .dot { animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .panel .ptoks { margin-left:6px; opacity:.7; }
+  .panel .reason { font-weight:600; }
+  .panel .reason-stop { color:var(--live); }
+  .panel .reason-length { color:var(--accent); }
+  .panel .reason-error { color:#e06c75; }
+  .panel .badge { font-weight:600; font-size:10px; letter-spacing:.03em;
+                  padding:1px 5px; border-radius:3px; cursor:help; }
+  .panel .badge-evicted { color:#e06c75; background:rgba(224,108,117,.15); }
+  .panel .badge-chunked { color:#61afef; background:rgba(97,175,239,.15); }
+  .panel .prompt { padding:8px 10px; color:var(--accent); font-size:11px;
+                   border-bottom:1px solid var(--border); white-space:nowrap;
+                   overflow:hidden; text-overflow:ellipsis; }
+  .panel .output { flex:1; padding:8px 10px; overflow-y:auto;
+                   word-break:break-word; line-height:1.4; }
+  .panel.idle .output::before { content:'waiting for a request...'; color:var(--dim); font-style:italic; }
+  .panel .output .thinking { color:var(--dim); font-style:italic; }
+
+  /* collapsed trace of the model's <think> reasoning, once it's done */
+  .panel .output .think-trace { margin-bottom:6px; color:var(--dim); font-size:11.5px; }
+  .panel .output .think-trace summary { cursor:pointer; font-style:italic; user-select:none; }
+  .panel .output .think-trace .think-body { margin-top:4px; padding-left:8px;
+                                             border-left:2px solid var(--border); }
+
+  /* minimal markdown rendering for the answer text */
+  .panel .output p { margin:4px 0; }
+  .panel .output p:first-child { margin-top:0; }
+  .panel .output h1, .panel .output h2, .panel .output h3 { margin:8px 0 3px; font-size:13px; color:var(--text); }
+  .panel .output ul, .panel .output ol { margin:4px 0; padding-left:18px; }
+  .panel .output code { background:#1c2230; padding:1px 4px; border-radius:3px; font-size:12px; }
+  .panel .output pre { background:#1c2230; padding:6px 8px; border-radius:4px; overflow-x:auto;
+                        margin:4px 0; white-space:pre-wrap; }
+  .panel .output pre code { background:none; padding:0; }
+  .panel .cachebar { height:4px; background:#1c2230; }
+  .panel .cachebar .fill { height:100%; background:var(--cached); }
+  .panel .metrics { padding:6px 10px; border-top:1px solid var(--border); font-size:11px;
+                    color:var(--dim); display:flex; gap:10px; flex-wrap:wrap; }
+  .panel .metrics b { color:var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>tinyserve &middot; live generations</h1>
+  <span class="stat">active <b id="n-active">0</b></span>
+  <span class="stat">completed <b id="n-done">0</b></span>
+</header>
+
+<section class="box">
+  <h2>server</h2>
+  <div class="bars">
+    <div class="bar-item">
+      <div class="bar-label"><span>tokens / step budget</span><span id="tok-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill" id="tok-fill" style="width:0%"></div></div>
+    </div>
+    <div class="bar-item">
+      <div class="bar-label"><span>kv cache used</span><span id="kv-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill kv" id="kv-fill" style="width:0%"></div></div>
+    </div>
+    <div class="bar-item">
+      <div class="bar-label"><span>prefix cache hit rate</span><span id="hit-label">-</span></div>
+      <div class="bar-track"><div class="bar-fill hit" id="hit-fill" style="width:0%"></div></div>
+    </div>
+    <span class="stat">running <b id="s-running">-</b></span>
+    <span class="stat">waiting <b id="s-waiting">-</b></span>
+  </div>
+</section>
+
+<section>
+  <div id="grid"></div>
+</section>
+
+<script>
+function colorForId(id) {
+  if (!id) return '#3a4150';
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360}, 65%, 55%)`;
+}
+function fmt(x, d) { d = d || 2; return (x === null || x === undefined) ? '-' : x.toFixed(d); }
+
+const grid = document.getElementById('grid');
+const maxPanels = parseInt(new URLSearchParams(location.search).get('panels')) || 16;
+const slotEls = [];     // fixed array of panel DOM elements, index = slot number - created once,
+                        // never removed; a slot's content is swapped as requests come and go
+const slotOwner = [];   // slotOwner[i] = rid currently occupying slot i, or null if idle
+const reqState = {};    // rid -> { slot: idx|null, text, prompt } - text/prompt buffer even
+                        // while waiting, so a promoted panel can show what's already happened
+const waiting = [];     // rids accepted but with no free slot yet - FIFO, oldest promoted first
+let nActive = 0, nDone = 0;
+
+function resetSlot(el, i) {
+  el.className = 'panel idle';
+  el.style.borderColor = '';
+  el.querySelector('.rid').textContent = `slot ${i}`;
+  el.querySelector('.ptoks').textContent = '';
+  el.querySelector('.prompt').textContent = '';
+  el.querySelector('.output').textContent = '';
+  el.querySelector('.ttft').textContent = '';
+  el.querySelector('.cachebar .fill').style.width = '0%';
+  el.querySelector('.metrics').innerHTML = '';
+}
+
+function makeSlot(i) {
+  const el = document.createElement('div');
+  el.innerHTML = `
+    <div class="bar"><span><span class="dot"></span><span class="rid"></span><span class="ptoks"></span></span><span class="ttft"></span></div>
+    <div class="prompt"></div>
+    <div class="output"></div>
+    <div class="cachebar" title="prefix-cache hit: what fraction of this request's prompt tokens were reused from a cached prefix instead of freshly computed (also shown as text in the row below)"><div class="fill" style="width:0%"></div></div>
+    <div class="metrics"></div>`;
+  grid.appendChild(el);
+  resetSlot(el, i);
+  slotEls.push(el);
+  slotOwner.push(null);
+}
+for (let i = 0; i < maxPanels; i++) makeSlot(i);
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// A small, dependency-free markdown-to-HTML pass - not full CommonMark,
+// just enough to make real model output (bold, lists, code, headers)
+// read cleanly instead of as a wall of raw plain text.
+function renderMarkdown(text) {
+  let html = escapeHtml(text);
+
+  html = html.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, code) => `<pre><code>${code}</code></pre>`);
+  html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  html = html.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+  html = html.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+
+  html = html.replace(/(^|\n)((?:[-*] .*(?:\n|$))+)/g, (m, pre, items) => {
+    const lis = items.trim().split('\n').map(l => `<li>${l.replace(/^[-*] /, '')}</li>`).join('');
+    return `${pre}<ul>${lis}</ul>`;
+  });
+  html = html.replace(/(^|\n)((?:\d+\. .*(?:\n|$))+)/g, (m, pre, items) => {
+    const lis = items.trim().split('\n').map(l => `<li>${l.replace(/^\d+\. /, '')}</li>`).join('');
+    return `${pre}<ol>${lis}</ol>`;
+  });
+
+  return html.split(/\n{2,}/).map(block => {
+    const trimmed = block.trim();
+    if (!trimmed) return '';
+    if (/^<(h\d|ul|ol|pre)/.test(trimmed)) return trimmed;
+    return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
+  }).join('');
+}
+
+// Qwen-style reasoning models wrap their scratch thinking in <think>...</think>
+// before the real answer. Stream the reasoning live (markdown-rendered, just
+// dimmed) as it's generated - while it's still open, it grows in place like
+// the answer does - then once it closes, fold the finished reasoning into a
+// collapsed "thinking" trace and render the actual answer below it.
+function renderOutput(el, text) {
+  const out = el.querySelector('.output');
+  const openIdx = text.indexOf('<think>');
+  const closeTag = '</think>';
+  const closeIdx = text.indexOf(closeTag);
+  if (openIdx === -1) {
+    out.innerHTML = renderMarkdown(text);
+  } else if (closeIdx === -1) {
+    const thinkSoFar = text.slice(openIdx + '<think>'.length);
+    out.innerHTML = `<div class="thinking">${renderMarkdown(thinkSoFar)}</div>`;
+  } else {
+    const thinkText = text.slice(openIdx + '<think>'.length, closeIdx).trim();
+    const answerText = text.slice(closeIdx + closeTag.length).replace(/^\s+/, '');
+    out.innerHTML =
+      (thinkText ? `<details class="think-trace"><summary>thinking</summary>` +
+        `<div class="think-body">${renderMarkdown(thinkText)}</div></details>` : '') +
+      renderMarkdown(answerText);
+  }
+  out.scrollTop = out.scrollHeight;
+}
+
+function assignSlot(rid) {
+  const i = slotOwner.indexOf(null);
+  if (i === -1) return false;
+  slotOwner[i] = rid;
+  const st = reqState[rid];
+  st.slot = i;
+  const el = slotEls[i];
+  el.className = 'panel live';
+  el.style.borderColor = colorForId(rid);
+  el.querySelector('.rid').textContent = rid.slice(-6);
+  el.querySelector('.ptoks').textContent = st.promptTokensEst ? `~${st.promptTokensEst} prompt tok` : '';
+  el.querySelector('.prompt').textContent = st.prompt;
+  renderOutput(el, st.text);
+  return true;
+}
+
+// promotes waiting requests into free slots, oldest first, until either
+// every slot is occupied or nothing is left waiting
+function showNext() {
+  while (waiting.length) {
+    const rid = waiting[0];
+    if (!(rid in reqState)) { waiting.shift(); continue; }  // finished before ever getting a turn
+    if (!assignSlot(rid)) break;                            // no free slot right now
+    waiting.shift();
+  }
+}
+
+function onStart(msg) {
+  reqState[msg.rid] = { slot: null, text: '', prompt: msg.prompt, promptTokensEst: msg.prompt_tokens_est };
+  nActive++;
+  document.getElementById('n-active').textContent = nActive;
+  waiting.push(msg.rid);
+  showNext();
+}
+
+function onToken(msg) {
+  const st = reqState[msg.rid];
+  if (!st) return;
+  st.text += msg.delta;
+  if (st.slot === null) return;  // buffered only - not on screen yet
+  const el = slotEls[st.slot];
+  renderOutput(el, st.text);
+  const rate = msg.n_tokens / Math.max(msg.elapsed, 0.001);
+  el.querySelector('.metrics').innerHTML =
+    `<span>${msg.n_tokens} tok</span><span><b>${fmt(rate, 1)}</b> tok/s</span><span>${fmt(msg.elapsed)}s</span>`;
+}
+
+function onDone(msg) {
+  const st = reqState[msg.rid];
+  if (!st) return;
+  nActive--; nDone++;
+  document.getElementById('n-active').textContent = nActive;
+  document.getElementById('n-done').textContent = nDone;
+
+  if (st.slot === null) {
+    delete reqState[msg.rid];  // never got a visible turn - nothing to animate
+    return;
+  }
+
+  const slotIdx = st.slot, el = slotEls[slotIdx];
+  el.classList.add('done');
+  if (msg.prompt_tokens) {
+    el.querySelector('.ptoks').textContent = `${msg.prompt_tokens} prompt tok`;
+  }
+  const ttftTxt = msg.ttft !== null ? `ttft ${fmt(msg.ttft)}s` : '';
+  const reasonTxt = msg.finish_reason
+    ? `<span class="reason reason-${msg.finish_reason}">${msg.finish_reason}</span>` : '';
+  const evictedTxt = msg.preempted
+    ? `<span class="badge badge-evicted" title="this request was preempted mid-flight to free KV cache space for an older one, then resumed">EVICTED</span>` : '';
+  const chunkedTxt = msg.chunked_prefill
+    ? `<span class="badge badge-chunked" title="this request's prompt was long enough that it needed more than one scheduler step to fully prefill">CHUNKED</span>` : '';
+  el.querySelector('.ttft').innerHTML =
+    [ttftTxt, reasonTxt, evictedTxt, chunkedTxt].filter(Boolean).join(' &middot; ');
+  // generation-time only (latency minus ttft/queueing wait), matching
+  // print_stats - otherwise this reads low for any request that spent a
+  // while queued before its first token
+  const genTime = Math.max(msg.latency - (msg.ttft || 0), 0.001);
+  const rate = msg.n_tokens / genTime;
+  const pct = msg.prompt_tokens ? (100 * msg.cached_tokens / msg.prompt_tokens) : 0;
+  el.querySelector('.cachebar .fill').style.width = pct.toFixed(0) + '%';
+  el.querySelector('.metrics').innerHTML =
+    `<span>${msg.n_tokens} tok</span><span><b>${fmt(rate, 1)}</b> tok/s</span>` +
+    `<span>${fmt(msg.latency)}s total</span>` +
+    (msg.cached_tokens ? `<span><b>${msg.cached_tokens}</b>/${msg.prompt_tokens} cached (${pct.toFixed(0)}%)</span>` : '');
+
+  // leave the final state on screen briefly, then free the slot - either
+  // straight into the next waiting request, or back to idle if none
+  setTimeout(() => {
+    delete reqState[msg.rid];
+    if (slotOwner[slotIdx] !== msg.rid) return;  // safety: already reused somehow
+    el.classList.add('fading');
+    setTimeout(() => {
+      slotOwner[slotIdx] = null;
+      if (waiting.length) showNext();
+      else resetSlot(el, slotIdx);
+    }, 300);
+  }, 4000);
+}
+
+// ---- server stats bars ----
+function onStats(m) {
+  const tokLabel = document.getElementById('tok-label');
+  const tokFill = document.getElementById('tok-fill');
+  if (m.tokens_last_step != null && m.max_num_batched_tokens) {
+    tokLabel.textContent = `${m.tokens_last_step}/${m.max_num_batched_tokens}`;
+    tokFill.style.width = Math.min(100, 100 * m.tokens_last_step / m.max_num_batched_tokens) + '%';
+  } else { tokLabel.textContent = '-'; tokFill.style.width = '0%'; }
+
+  const kvLabel = document.getElementById('kv-label');
+  const kvFill = document.getElementById('kv-fill');
+  if (m.total_kv_blocks && m.free_kv_blocks != null) {
+    const used = m.total_kv_blocks - m.free_kv_blocks;
+    const pct = 100 * used / m.total_kv_blocks;
+    kvLabel.textContent = `${pct.toFixed(0)}% (${used}/${m.total_kv_blocks})`;
+    kvFill.style.width = pct + '%';
+  } else { kvLabel.textContent = '-'; kvFill.style.width = '0%'; }
+
+  const hitLabel = document.getElementById('hit-label');
+  const hitFill = document.getElementById('hit-fill');
+  if (m.total_prompt_tokens) {
+    const pct = 100 * m.total_cached_tokens / m.total_prompt_tokens;
+    hitLabel.textContent = pct.toFixed(0) + '%';
+    hitFill.style.width = pct + '%';
+  } else { hitLabel.textContent = '-'; hitFill.style.width = '0%'; }
+
+  document.getElementById('s-running').textContent = m.running ?? '-';
+  document.getElementById('s-waiting').textContent = m.waiting ?? '-';
+}
+
+// ---- websocket ----
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'start') onStart(msg);
+  else if (msg.type === 'token') onToken(msg);
+  else if (msg.type === 'done') onDone(msg);
+  else if (msg.type === 'stats') onStats(msg.data);
+};
+ws.onclose = () => { document.querySelector('header h1').textContent += ' (disconnected)'; };
+</script>
+</body>
+</html>
