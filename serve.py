@@ -1460,6 +1460,11 @@ class ModelRunner:
         self.cfg = cfg
         torch.manual_seed(cfg.seed)
 
+        # Memory other processes may hold on this GPU measured before we allocate anything
+        # or run any forward pass 
+        free, total = torch.cuda.mem_get_info()
+        self.used_by_others = total - free
+
         t = time.time()
         self.model = load_model(
             cfg.model, cfg.dtype, cfg.max_model_len, TP_RANK, TP_SIZE, cfg.expert_parallel
@@ -1592,11 +1597,14 @@ class ModelRunner:
         # other = bytes held by someone else (or untracked)
         peak = torch.cuda.max_memory_allocated()
         free, total = torch.cuda.mem_get_info()
-        other = total - free - torch.cuda.memory_reserved()
+        reserved = torch.cuda.memory_reserved()
+        untracked = max(0, total - free - reserved - self.used_by_others)
 
-        # Leave (1 - gpu_memory_utilization) headroom, don't steal other,
-        # and keep peak free so the next real forward still fits beside the cache.
-        budget = total * self.cfg.gpu_memory_utilization - other - peak
+        # Our share of the card, minus what we already use
+        budget = total * self.cfg.gpu_memory_utilization - untracked - peak
+
+        # Never allocate more than is actually free though
+        budget = min(budget, free + reserved - peak)
 
         # Bytes for one page id across every layer:
         #   2 (K and V) * L * tokens/page * Hkv * D * 2 bytes (fp16/bf16)
