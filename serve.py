@@ -1185,7 +1185,11 @@ class Model(nn.Module):
         self.tie = getattr(cfg, "tie_word_embeddings", False)
 
         if not self.tie:
-            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+            ### If the weights arent tied we need a separate lm head (typical for larger models)
+            ### Also if tensor parallel, each worker will be responsible for a part of the 
+            ### vocabulary (otherwise the full load only falls on rank 0) 
+            per_rank_output = -(-cfg.vocab_size // TP_SIZE) # ceiling division
+            self.lm_head = nn.Linear(cfg.hidden_size, per_rank_output, bias=False)
 
         # RoPE table indexed by absolute position
         rope = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
@@ -1207,55 +1211,132 @@ class Model(nn.Module):
         return add_rmsnorm(self.norm, x, residual)[0]     # the last residual add + final norm
 
     def logits(self, hidden):
-        ### separate method to get logis
-        w = self.embed_tokens.weight if self.tie else self.lm_head.weight
-        return hidden @ w.t()
+        ### method to get logits
+        if TP_SIZE == 1:
+            return hidden @ self.embed_tokens.weight.t() if self.tie else self.lm_head(hidden)
 
-def load_model(name: str, dtype, max_position: int, tp_rank: int = 0, tp_size: int = 1,
-               expert_parallel: bool = False):
-    """quick helper method to load weights into our model (this rank's shard of them)"""
+        ### If distributed, each rank predicts its own chunk of the vocab (for each token)
+        ### and if we have 2 gpus, each GPU predcts half the vocab that needs to be gathered
+        V = self.cfg.vocab_size
+        n = -(-V//TP_SIZE) # ceiling div
+
+        ### if weights are tied, the embedding is whole on every GPU (no parallelism on the 
+        ### embedding matrix as its simple lookup), so slice the piece we need and forwrd
+        if self.tie:
+            part = hidden @ self.embed_tokens.weight[TP_RANK * n:(TP_RANK + 1) * n].t()
+
+            if part.shape[1] < n:   # last rank, vocabulary that doesn't divide evenly: pad to n like lm_head
+                part = F.pad(part, (0, n - part.shape[1]))
+
+        ### If the LM Head doesnt share weights then those weights have been split, and
+        ### if our goal is the final [T x V], each gpu has a portion of those V (zeroed out)
+        ### for invalid locations
+        else:
+            part = self.lm_head(hidden)
+
+        ### Each rank now has [T x ceil(V/TP_SIZE)] outputs, we need to concat on the last dimension
+        ### So rank 0 (responsible for sampling) has the full vocab size
+        parts = part.new_empty(TP_SIZE, *part.shape)
+        dist.all_gather_into_tensor(parts, part.contiguous())
+
+        ### [GPU, row, slice] -> [row, GPU * slice] = [row, vocab].
+        return parts.permute(1,0,2).reshape(part.shape[0], TP_SIZE * n)[:, :V] # clipped to actual vocabulary
+
+def load_model(name, 
+               dtype, 
+               max_position, 
+               tp_rank = 0, 
+               tp_size = 1, 
+               expert_parallel=False
+):
+    """
+    Helper method to load weights into the model (this ranks shard of them)
+    """
+
     path = name if os.path.isdir(name) else snapshot_download(
-        name, allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"])
+        name, allow_patterns=["*.json", "tokenizer*", "*.txt", "*.safetensors"]
+    )
+
     cfg = AutoConfig.from_pretrained(path)
-    assert cfg.model_type in SUPPORTED_MODELS, \
-        f"model_type {cfg.model_type!r} isn't supported, these are: {SUPPORTED_MODELS}"
+    assert cfg.model_type in SUPPORTED_MODELS, f"model_type {cfg.model_type!r} isn't supported, these are: {SUPPORTED_MODELS}"
+
     if tp_size > 1:
         cfg = shard_config(cfg, tp_size, tp_rank, expert_parallel)
+
+    # load model in our wanted dtype
     torch.set_default_dtype(dtype)
     with torch.device("cuda"):
         model = Model(cfg, max_position)
+
+    # set back to the standard float32
     torch.set_default_dtype(torch.float32)
     params = dict(model.named_parameters())
     loaded, unused = set(), []
+
+    def assign(path, attr, src, rows=None):
+        # path: lm_head
+        # attr: weight
+        # src: tensor to copy in
+        # rows: what row indexed to copy into   
+
+        # search for a key like "lm_head"
+        module = model.get_submodule(path)
+
+        # what are the assigned rows
+        r = rows if rows is not None else slice(None)
+
+        # basically lm_head.weight[rows] = src inplace
+        getattr(module, attr)[r].copy_(src)
+
+        # remember it was filled, so we can check nothing was missed at the end
+        loaded.add(f"{path}.{attr}")
+
+    def load_tensor(fh, key):
+        # one checkpoint tensor (this GPU's slice of it) into the model
+        name_ = key.removeprefix("model.")
+
+        ### MoE: separate tensors per expert go into the layer's stacked w13 / w2 ###
+        if m := EXPERT_KEY.fullmatch(name_):
+            moe = model.layers[int(m[1])].mlp
+            if moe.load_expert(int(m[2]), m[3], fh, key, tp_rank, tp_size):
+                loaded.add(f"layers.{m[1]}.mlp.{'w2' if m[3] == 'down_proj' else 'w13'}")
+
+        ### q/k/v and gate/up: each goes into its row range of the fused projection.
+        ### load_shard still sees the original name, so under tensor parallelism it
+        ### returns THIS GPU's slice of q (or k, ...), and each GPU's fused weight
+        ### ends up [its q heads; its k heads; its v heads], never a cut of the stack
+        elif m := FUSED_KEY.fullmatch(name_):
+            module = model.get_submodule(m[1])
+            fused, part = FUSED_PARTS[m[2]]
+            sizes = module.qkv_sizes if fused == "qkv_proj" else module.gate_up_sizes
+            start = sum(sizes[:part])
+            assign(f"{m[1]}.{fused}", m[3], load_shard(fh, key, tp_rank, tp_size),
+                   rows=slice(start, start + sizes[part]))
+
+        ### lm_head under tensor parallel: this GPU's rows of the vocabulary. The last ###
+        ### GPU's slice can be short; its spare rows stay zero, and Model.logits ###
+        ### drops their scores ###
+        elif name_ == "lm_head.weight" and tp_size > 1 and not model.tie:
+            sl = fh.get_slice(key)
+            n = model.lm_head.out_features
+            lo, hi = tp_rank * n, min((tp_rank + 1) * n, sl.get_shape()[0])
+            model.lm_head.weight.zero_()
+            assign("lm_head", "weight", sl[lo:hi], rows=slice(0, hi - lo))
+
+        # everything else: a parameter with the same name (norms, embedding, o_proj, ...)
+        elif name_ in params:
+            path, _, attr = name_.rpartition(".")
+            assign(path, attr, load_shard(fh, key, tp_rank, tp_size))
+
+        # the checkpoint has it, we don't (e.g. lm_head.weight on a tied model)
+        else:
+            unused.append(key)
+
     with torch.no_grad():
         for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
             with safe_open(f, "pt", device=f"cuda:{torch.cuda.current_device()}") as fh:
                 for key in fh.keys():
-                    name_ = key.removeprefix("model.")
-
-                    ### MoE: separate tensors per expert go into the layer's stacked w13 / w2 ###
-                    if m := EXPERT_KEY.fullmatch(name_):
-                        moe = model.layers[int(m[1])].mlp
-                        if moe.load_expert(int(m[2]), m[3], fh, key, tp_rank, tp_size):
-                            loaded.add(f"layers.{m[1]}.mlp.{'w2' if m[3] == 'down_proj' else 'w13'}")
-
-                    ### q/k/v and gate/up: each goes into its row range of the fused projection.
-                    ### load_shard still sees the original name, so under tensor parallelism it
-                    ### returns THIS GPU's slice of q (or k, ...), and each GPU's fused weight
-                    ### ends up [its q heads; its k heads; its v heads], never a cut of the stack
-                    elif m := FUSED_KEY.fullmatch(name_):
-                        module = model.get_submodule(m[1])
-                        fused, part = FUSED_PARTS[m[2]]
-                        sizes = module.qkv_sizes if fused == "qkv_proj" else module.gate_up_sizes
-                        start = sum(sizes[:part])
-                        getattr(getattr(module, fused), m[3])[start:start + sizes[part]].copy_(
-                            load_shard(fh, key, tp_rank, tp_size))
-                        loaded.add(f"{m[1]}.{fused}.{m[3]}")
-                    elif name_ in params:
-                        params[name_].copy_(load_shard(fh, key, tp_rank, tp_size))
-                        loaded.add(name_)
-                    else:
-                        unused.append(key)
+                    load_tensor(fh, key)
 
     ### a weight the checkpoint never filled would silently stay random, so fail loudly ###
     ### (usually a new architecture whose names don't match ours) ###
@@ -1919,12 +2000,14 @@ class ModelRunner:
         if TP_SIZE > 1:
             tp_broadcast(prepared)
 
+        return self.forward_logits(packed, mode, size)
+
+    @torch.inference_mode()
+    def forward_logits(self, packed: PackedBatch, mode: str, size: int | None):
+        """The forward pass, then the logits of each real request's last query (every rank)"""
         hidden = self.forward_step(packed, mode, size)
-
-        # hidden is  packed [T, ...], logit_rows indexes the last query of
-        # each real request, and graph padding is skipped. 
-        return self.model.logits(hidden[to_gpu(packed.logit_rows, torch.int64)])
-
+        return self.model.logits(hidden[to_gpu(packed.logit_rows, torch.int64)]) 
+    
     @torch.inference_mode()
     def launch_sample(self, batch: list[ScheduledRequest], logits: torch.Tensor) -> torch.cuda.Event:
         """
@@ -1978,7 +2061,7 @@ def tp_worker(rank: int, cfg: Config, port: int):
 
     ### wait for rank 0 to broadcast the next inference step, run it, repeat ###
     while (step := tp_broadcast()) is not None:
-        runner.forward_step(*step)
+        runner.forward_logits(*step)
 
     ### stop_tensor_parallel() on rank 0 broadcast None. Release this process's ###
     ### own resources, the same way rank 0 does ###
