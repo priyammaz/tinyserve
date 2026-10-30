@@ -170,7 +170,7 @@ vLLM rows use vLLM's "Triton attention + full CUDA graphs" setting. In the Rando
 ### Things I Need To Explore
 - [ ] vLLM performs better on multiGPU on smaller models (could be an NCCL Bottleneck?)
 - [ ] MoE is slow on decoding compared to vLLM for 1 user (Fuse MoE routing as well)
-- [ ] KVCache Allocation for the same `gpu_memory_utilization` is less here compared to vLLM
+- [x] KVCache Allocation for the same `gpu_memory_utilization` is less here compared to vLLM
 - [ ] KVCache write can be fused into `qk_norm_rope` (the values are just copied in, the keys, after RoPE are copied in)
 - [ ] In TP>1, the `lm_head` is only run by the main GPU, we can split vocab under TP and then all-gather after
 
