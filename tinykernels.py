@@ -115,9 +115,13 @@ def _norm_rope_heads(
     t, 
     n_heads, 
     eps,
+    cache_ptr, 
+    slot, 
+    cache_stride,
     HAS_NORM: tl.constexpr, 
     HP: tl.constexpr,       # HP is padded number of heads (next power of 2)
-    HALF: tl.constexpr
+    HALF: tl.constexpr, 
+    WRITE: tl.constexpr = False # only for the keys will we write 
 ):
     
     # Process all heads for one token. Each head has D dimensions, split
@@ -146,8 +150,16 @@ def _norm_rope_heads(
         x2 = (x2 * rstd * w2).to(x_ptr.dtype.element_ty).to(tl.float32)
 
     # [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
-    tl.store(base + d, (x1 * cos - x2 * sin).to(x_ptr.dtype.element_ty), mask=mask)
-    tl.store(base + HALF + d, (x2 * cos + x1 * sin).to(x_ptr.dtype.element_ty), mask=mask)
+    o1 = (x1 * cos - x2 * sin).to(x_ptr.dtype.element_ty)
+    o2 = (x2 * cos + x1 * sin).to(x_ptr.dtype.element_ty)
+    tl.store(base + d, o1, mask=mask)
+    tl.store(base + HALF + d, o2, mask=mask)
+
+    # k: goes straight into KV cache slot too
+    if WRITE:
+        cache_start = cache_ptr + slot * cache_stride + heads * (2 * HALF)
+        tl.store(cache_start + d, o1, mask=mask)
+        tl.store(cache_start + HALF + d, o2, mask=mask)
 
 @triton.autotune(configs=[triton.Config({}, num_warps=w) for w in (1, 2, 4, 8)],
                  key=["n_q_heads", "n_k_heads", "HALF", "HAS_NORM"], restore_value=["q_ptr", "k_ptr"])
@@ -159,10 +171,17 @@ def _qk_norm_rope_kernel(
     sin_ptr, 
     qw_ptr, 
     kw_ptr,
+    v_ptr,          # The values are just written to kv cache
+    k_cache_ptr,    
+    v_cache_ptr,     
+    slot_ptr,       # [T] each token's cache slot
     q_tok_stride, 
     q_head_stride, 
     k_tok_stride, 
     k_head_stride, 
+    v_tok_stride, 
+    v_head_stride,
+    cache_stride,
     cs_stride,
     n_q_heads, 
     n_k_heads, 
@@ -170,7 +189,8 @@ def _qk_norm_rope_kernel(
     HAS_NORM: tl.constexpr, 
     QP: tl.constexpr, 
     KP: tl.constexpr,
-    HALF: tl.constexpr
+    HALF: tl.constexpr,
+    WRITE_KV: tl.constexpr = False,
 ):
     # one program per token: its cos/sin row is loaded once and shared by
     # every q head and every k head
@@ -178,22 +198,50 @@ def _qk_norm_rope_kernel(
     d = tl.arange(0, HALF)[None, :]
     cos = tl.load(cos_ptr + t * cs_stride + d)
     sin = tl.load(sin_ptr + t * cs_stride + d)
-    _norm_rope_heads(q_ptr, q_tok_stride, q_head_stride, qw_ptr, 
-                     cos, sin, t, n_q_heads, eps, HAS_NORM, QP, HALF)
-    _norm_rope_heads(k_ptr, k_tok_stride, k_head_stride, kw_ptr, 
-                     cos, sin, t, n_k_heads, eps, HAS_NORM, KP, HALF)
 
-def qk_norm_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                 q_weight: torch.Tensor | None = None, k_weight: torch.Tensor | None = None,
-                 eps: float = 1e-6):
+    slot = t  # placeholder
+    if WRITE_KV:
+        slot = tl.load(slot_ptr + t).to(tl.int64) # index over to this tokens final storage slot
+        
+    _norm_rope_heads(q_ptr, q_tok_stride, q_head_stride, qw_ptr, 
+                     cos, sin, t, n_q_heads, eps, k_cache_ptr, slot, cache_stride, HAS_NORM, QP, HALF)
+    _norm_rope_heads(k_ptr, k_tok_stride, k_head_stride, kw_ptr, 
+                     cos, sin, t, n_k_heads, eps, k_cache_ptr, slot, cache_stride, HAS_NORM, KP, HALF,
+                     WRITE=WRITE_KV)
+
+    # the values get no rope so we write that here directly, to avoid another index_copy_
+    if WRITE_KV:
+        heads = tl.arange(0, KP)[:, None]
+        head_dim_offset = tl.arange(0, 2 * HALF)[None, :] # [1 x HEAD_DIM]
+        mask = heads < n_k_heads # [HEADS_PADDED x 1]
+        vals = tl.load(v_ptr + t * v_tok_stride + heads * v_head_stride + head_dim_offset, mask=mask)
+        tl.store(v_cache_ptr + slot * cache_stride + heads * (2 * HALF) + head_dim_offset, vals, mask=mask)
+
+def qk_norm_rope(
+        q: torch.Tensor, 
+        k: torch.Tensor, 
+        cos: torch.Tensor, 
+        sin: torch.Tensor,
+        q_weight: torch.Tensor | None = None, 
+        k_weight: torch.Tensor | None = None,
+        eps: float = 1e-6, 
+        v: torch.Tensor | None = None, 
+        k_cache: torch.Tensor | None = None,
+        v_cache: torch.Tensor | None = None, 
+        slot_mapping: torch.Tensor | None = None
+):
     """
-    In place on q [T, H, D] and k [T, Hkv, D], optional per-head RMSNorm
-    (Qwen3's q_norm / k_norm), then rotate-half RoPE with cos/sin [T, D/2].
+    In-Place RoPE on q [T, H, D] and k [T, Hkv, D] with an optional per-head RMSNorm
+    that Qwen3 Uses. Additionally we the keys and values are directly written to the 
+    KV cache here to avoid two more index copy ops later
     """
     T, H, D = q.shape
     assert D % 2 == 0 and triton.next_power_of_2(D // 2) == D // 2, "head_dim/2 must be a power of 2"
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and cos.stride(-1) == 1 and sin.stride(-1) == 1
     has_norm = q_weight is not None
+    write_kv = slot_mapping is not None
+    if write_kv:
+        assert v.stride(-1) == 1 and k_cache.is_contiguous() and v_cache.is_contiguous()
 
     _qk_norm_rope_kernel[(T,)](
         q, 
@@ -202,10 +250,17 @@ def qk_norm_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch
         sin,
         q_weight if has_norm else q, 
         k_weight if has_norm else k,
+        v if write_kv else q,
+        k_cache if write_kv else q,
+        v_cache if write_kv else q,
+        slot_mapping if write_kv else q,
         q.stride(0), 
         q.stride(1), 
         k.stride(0), 
         k.stride(1), 
+        v.stride(0) if write_kv else 0,
+        v.stride(1) if write_kv else 0,
+        k.shape[1] * D,
         cos.stride(0),
         H, 
         k.shape[1], 
@@ -214,6 +269,7 @@ def qk_norm_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch
         QP=triton.next_power_of_2(H),
         KP=triton.next_power_of_2(k.shape[1]), 
         HALF=D // 2,
+        WRITE_KV=write_kv,
     )
 
     return q, k

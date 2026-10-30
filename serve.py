@@ -839,11 +839,24 @@ class Attention(nn.Module):
 
         ### Optionally use triton kernels for fused ops ###
         if TRITON_KERNELS:
-            # q/k norm and both rotary embeddings in one kernel, in place
+            ### q/k norm and rotary embeds in one kernel inplace. Once there is 
+            ### a KVCache (not during any profiling runs), the same kernel
+            ### will also write to this steps K,V directly
+            meta = ATTN_META
+            cache_args = {}
+            if meta is not None:
+                cache_args = {
+                    "v": v, 
+                    "k_cache": self.kv_cache[0],
+                    "v_cache": self.kv_cache[1],
+                    "slot_mapping": meta.slot_mapping
+                }
+
             tk.qk_norm_rope(q, k, cos, sin,
                             self.q_norm.weight if self.qk_norm else None,
                             self.k_norm.weight if self.qk_norm else None,
-                            self.q_norm.eps if self.qk_norm else 0.0)
+                            self.q_norm.eps if self.qk_norm else 0.0,
+                            **cache_args)
         else:
             if self.qk_norm:
                 q, k = self.q_norm(q), self.k_norm(k)
@@ -871,9 +884,12 @@ class Attention(nn.Module):
 
         # Write this step's new K/V into the page pool before attention
         # (slot_mapping has one slot per token, padding tokens go to the null page 0)
+        # if using triton kernels, then this was already fused in earlier
         k_cache, v_cache = self.kv_cache[0], self.kv_cache[1]
-        k_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, k)
-        v_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, v)
+
+        if not TRITON_KERNELS:
+            k_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, k)
+            v_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, v)
 
         return ATTN_FN(q, k_cache, v_cache, meta, self.D ** -0.5)
 
