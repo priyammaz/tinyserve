@@ -108,41 +108,37 @@ Everything below is run on my local **2 x A6000** system with **4096-token conte
 
 ### 200 Request Burst
 
-|            | Qwen3-0.6B |          | Qwen3-8B |          | Qwen3-32B |          | Qwen3-30B-A3B |          |
-|------------|-----------:|---------:|---------:|---------:|----------:|---------:|--------------:|---------:|
-|            | 1 GPU      | 2 GPU    | 1 GPU    | 2 GPU    | 1 GPU     | 2 GPU    | 1 GPU         | 2 GPU    |
+|               | Qwen3-0.6B |          | Qwen3-8B |          | Qwen3-32B |          | Qwen3-30B-A3B |          |
+|---------------|-----------:|---------:|---------:|---------:|----------:|---------:|--------------:|---------:|
+|               | 1 GPU      | 2 GPU    | 1 GPU    | 2 GPU    | 1 GPU     | 2 GPU    | 1 GPU         | 2 GPU    |
 | tinyserve 1.0 | 3,242      | n/a      | 1,255    | n/a      | OOM       | n/a      | OOM           | n/a      |
-| **tinyserve 2.0** | **6,825**  | **9,629**| **1,897**| **2,905**| OOM       | **631**  | OOM           | **1,883**|
-| vLLM | 6,206      | 8,746    | 1,843    | 2,976    | OOM       | 732      | OOM           | 1,986    |
-
-
+| tinyserve 2.0 | **6,825**  | **9,629** | **1,897** | 2,905    | OOM       | 631      | OOM           | 1,883    |
+| vLLM          | 6,206      | 8,746    | 1,843    | **2,976** | OOM       | **732**  | OOM           | **1,986** |
 
 ### One User At a Time
 |                       | Qwen3-0.6B |        | Qwen3-8B |        | Qwen3-32B |       | Qwen3-30B-A3B |       |
 |-----------------------|-----------:|-------:|---------:|-------:|----------:|------:|--------------:|------:|
 |                       | 1 GPU      | 2 GPU  | 1 GPU    | 2 GPU  | 1 GPU     | 2 GPU | 1 GPU         | 2 GPU |
 | tinyserve 2.0, tok/s  | 380.6      | 408.9  | 41.9     | 69.0   | OOM       | 18.5  | OOM           | 86.4  |
-| vLLM, tok/s            | 394.4      | 533.0  | 42.4     | 77.1   | OOM       | 19.3  | OOM           | 135.6 |
-| tinyserve 2.0, TTFT (24 tokens) | 4 ms | 5 ms | 26 ms | 17 ms | OOM | 57 ms | OOM | 35 ms |
-| vLLM, TTFT             | 5 ms       | 5 ms   | 27 ms    | 16 ms  | OOM       | 55 ms | OOM           | 19 ms |
-| tinyserve 2.0, TTFT (2,000 tokens) | 31 ms | 29 ms | 294 ms | 188 ms | OOM | 780 ms | OOM | 144 ms |
+| vLLM, tok/s           | **394.4**  | **533.0** | **42.4** | **77.1** | OOM     | **19.3** | OOM        | **135.6** |
 
 ### Random Arrivals
-| Model | Config | Burst (s) | Burst tok/s | Latency p50 / p99 (s) | TTFT p50 (s) | tok/s per request |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3-0.6B (40 req/s) | tinyserve 2.0, 1 GPU | 8.9 | 6,825 | 12.8 / 20.7 | 4.91 | 31.0 |
-| | vLLM, 1 GPU | 9.8 | 6,206 | 11.0 / 17.9 | 3.42 | 31.8 |
-| | tinyserve 2.0, 2 GPU | 6.3 | 9,629 | 3.3 / 5.1 | 0.15 | 77.8 |
-| | vLLM, 2 GPU | 6.9 | 8,746 | 2.7 / 4.1 | 0.10 | 96.7 |
-| Qwen3-8B (8 req/s) | tinyserve 2.0, 1 GPU | 31.9 | 1,897 | 18.3 / 20.2 | 0.29 | 14.1 |
-| | vLLM, 1 GPU | 32.9 | 1,843 | 19.4 / 22.4 | 0.26 | 13.0 |
-| | tinyserve 2.0, 2 GPU | 20.8 | 2,905 | 7.7 / 9.1 | 0.13 | 33.4 |
-| | vLLM, 2 GPU | 20.3 | 2,976 | 6.6 / 7.8 | 0.10 | 39.2 |
-| Qwen3-32B (2 req/s) | tinyserve 2.0, 2 GPU | 96.0 | 631 | 23.9 / 26.8 | 0.42 | 10.8 |
-| | vLLM, 2 GPU | 82.6 | 732 | 23.0 / 26.0 | 0.35 | 11.2 |
-| Qwen3-30B-A3B (2 req/s) | tinyserve 2.0, 2 GPU | 32.1 | 1,883 | 8.5 / 9.9 | 0.15 | 29.4 |
-| | vLLM, 2 GPU | 30.5 | 1,986 | 8.4 / 9.7 | 0.11 | 30.0 |
+| Model | Config | Burst tok/s | Latency p50 / p99 (s) | TTFT p50 (s) | tok/s per request |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B (40 req/s) | tinyserve 2.0, 1 GPU | **6,825** | 12.8 / 20.7 | 4.91 | 31.0 |
+| | vLLM, 1 GPU | 6,206 | **11.0** / **17.9** | **3.42** | **31.8** |
+| | tinyserve 2.0, 2 GPU | **9,629** | 3.3 / 5.1 | 0.15 | 77.8 |
+| | vLLM, 2 GPU | 8,746 | **2.7** / **4.1** | **0.10** | **96.7** |
+| Qwen3-8B (8 req/s) | tinyserve 2.0, 1 GPU | **1,897** | **18.3** / **20.2** | 0.29 | **14.1** |
+| | vLLM, 1 GPU | 1,843 | 19.4 / 22.4 | **0.26** | 13.0 |
+| | tinyserve 2.0, 2 GPU | 2,905 | 7.7 / 9.1 | 0.13 | 33.4 |
+| | vLLM, 2 GPU | **2,976** | **6.6** / **7.8** | **0.10** | **39.2** |
+| Qwen3-32B (2 req/s) | tinyserve 2.0, 2 GPU | 631 | 23.9 / 26.8 | 0.42 | 10.8 |
+| | vLLM, 2 GPU | **732** | **23.0** / **26.0** | **0.35** | **11.2** |
+| Qwen3-30B-A3B (2 req/s) | tinyserve 2.0, 2 GPU | 1,883 | 8.5 / 9.9 | 0.15 | 29.4 |
+| | vLLM, 2 GPU | **1,986** | **8.4** / **9.7** | **0.11** | **30.0** |
 
+vLLM rows use vLLM's "Triton attention + full CUDA graphs" setting. In the Random Arrivals table, "Burst tok/s" is taken from the 200 Request Burst test. When 200 requests are provided up front, tinyserve 2.0 outperforms vLLM on a single GPU for both small models (+10% on Qwen3-0.6B and +3% on Qwen3-8B), but on 2 GPUs it stays ahead only on Qwen3-0.6B (+10%) and falls behind on the larger models (−2% on Qwen3-8B, −5% on Qwen3-30B-A3B and −14% on Qwen3-32B).
 
 ## Plan
 
@@ -163,7 +159,7 @@ Everything below is run on my local **2 x A6000** system with **4096-token conte
 
 ### Increase Supported Models
 - [ ] Muse Glimmer
-- [ ] Qwen 3-Next
+- [ ] Qwen 3-Next Family
 - [ ] Qwen 3.6 Family
 - [ ] Gemma4 Family
 
@@ -172,8 +168,11 @@ Everything below is run on my local **2 x A6000** system with **4096-token conte
 - [ ] Quantized Models
   
 ### Things I Need To Explore
-- [ ] vLLM performs better on multiGPU on smaller models
-- [ ] MoE is slow on decoding compared to vLLM for 1 user
+- [ ] vLLM performs better on multiGPU on smaller models (could be an NCCL Bottleneck?)
+- [ ] MoE is slow on decoding compared to vLLM for 1 user (Fuse MoE routing as well)
+- [ ] KVCache Allocation for the same `gpu_memory_utilization` is less here compared to vLLM
+- [ ] KVCache write can be fused into `qk_norm_rope` (the values are just copied in, the keys, after RoPE are copied in)
+- [ ] In TP>1, the `lm_head` is only run by the main GPU, we can split vocab under TP and then all-gather after
 
 
 
