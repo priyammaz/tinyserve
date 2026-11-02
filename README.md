@@ -1,5 +1,5 @@
 # tinyserve
-<img src="imgs/banner.png" alt="img" width="700"/>
+<img src="banner.png" alt="img" width="700"/>
 
 LLM inference is all the rage these days! Whether it is user-side inference or rollout generation for RL post-training, being able to serve LLMs fast matters. tinyserve is a small, readable, vLLM-style inference engine: the whole scheduler, KV cache, model, tensor parallelism and HTTP server live in one file, `serve.py`, and the GPU kernels live in a second one, `tinykernels.py`.
 
