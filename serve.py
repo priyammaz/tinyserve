@@ -12,11 +12,13 @@ import asyncio
 import atexit
 import copy
 import datetime
+import faulthandler
 import glob
 import json
 import os
 import queue
 import re
+import signal
 import socket
 import threading
 import time
@@ -50,6 +52,7 @@ except:
 
 try:
     import tinykernels as tk
+    import tinycomm as tc
     TRITON_KERNELS_AVAILABLE = True
 except Exception:
     TRITON_KERNELS_AVAILABLE = False
@@ -60,6 +63,7 @@ TRITON_KERNELS = True   # layers call the fused kernels in tinykernels.py instea
 ATTN_META = None         # AttnMetadata for this step, None during the memory profiling run
 TP_RANK, TP_SIZE = 0, 1  # By default we use rank 0 with 1 worker.
 TP_CPU_GROUP = None      # gloo (CPU) group used to broadcast python objects each step
+TP_P2P = None            # tc.P2PAllReduce when cfg.p2p_all_reduce, else tp_all_reduce uses NCCL
 TP_WORKERS: list = []    # rank 0 only: the worker processes, so /health can notice one dying
 COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
 ROW_PARALLEL = ("o_proj", "down_proj")
@@ -87,6 +91,7 @@ class Config:
 
     tensor_parallel_size: int = 1 # split dense layers like Megatron
     expert_parallel: bool = False # MoE under tp > 1: whole experts per GPU instead of slicing every expert
+    p2p_all_reduce: bool = True # tp > 1: our all-reduce over NVLink/P2P (tinycomm.py) instead of NCCL
 
 
     def __post_init__(self):
@@ -100,6 +105,10 @@ class Config:
             if self.attention_backend == "triton":
                 self.attention_backend = "flash_attn" if FLASH_ATTN_AVAILABLE else "torch"
             self.use_triton_kernels = False
+
+        # the P2P all-reduce is one of the Triton kernels: --no-triton-kernels means NCCL
+        if not self.use_triton_kernels:
+            self.p2p_all_reduce = False
 
         # set page size as small as possible based on backend
         if self.block_size == 0:
@@ -781,6 +790,9 @@ def tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     Both workers receive the complete output y.
     """
     if TP_SIZE > 1:
+        # if it fits launch it on our own P2P comm
+        if TP_P2P is not None and TP_P2P.fits(x):
+            return TP_P2P(x)
         dist.all_reduce(x)
     return x
 
@@ -1062,6 +1074,18 @@ class SparseMoE(nn.Module):
         return True
 
     def forward(self, x):
+        if TRITON_KERNELS:
+            ### the routing below in one kernel, then the fused expert GEMMs ###
+            topk_weights, topk_ids = tk.moe_route(self.gate(x), self.top_k, self.norm_topk_prob,
+                                                  self.expert_map)
+
+            # tensor parallel with our all-reduce: it sums each token's top_k expert rows too
+            # one kernel instead of fused_moe's sum and then the all-reduce
+            if TP_P2P is not None and TP_P2P.fits(x, 1):
+                rows = tk.fused_moe(x, self.w13, self.w2, topk_weights, topk_ids, sum_topk=False)
+                return TP_P2P(rows, topk=self.top_k)
+            return tp_all_reduce(tk.fused_moe(x, self.w13, self.w2, topk_weights, topk_ids))
+
         ### route: softmax over all experts, keep the top_k, optionally renormalize them ###
         probs = self.gate(x).float().softmax(-1)
         topk_weights, topk_ids = probs.topk(self.top_k, dim=-1)
@@ -1071,11 +1095,8 @@ class SparseMoE(nn.Module):
         ### global ids -> local ids (-1 for other GPUs' experts under EP) ###
         topk_ids = self.expert_map[topk_ids]
 
-        ### pick between options
-        moe = tk.fused_moe if TRITON_KERNELS else moe_reference
-
         ### all reduce between GPUs
-        return tp_all_reduce(moe(x, self.w13, self.w2, topk_weights, topk_ids))
+        return tp_all_reduce(moe_reference(x, self.w13, self.w2, topk_weights, topk_ids))
 
 class DecoderLayer(nn.Module):
     def __init__(self, cfg, i):
@@ -1594,10 +1615,20 @@ class ModelRunner:
             "triton": triton_attention,
         }
 
-        global ATTN_FN, TRITON_KERNELS
+        global ATTN_FN, TRITON_KERNELS, TP_P2P
         ATTN_FN = ATTENTION_BACKENDS[cfg.attention_backend]
         TRITON_KERNELS = cfg.use_triton_kernels
 
+        if TP_SIZE > 1 and cfg.p2p_all_reduce:
+            if tc.P2PAllReduce.supported(TP_SIZE):
+                TP_P2P = tc.P2PAllReduce(TP_CPU_GROUP, TP_RANK, TP_SIZE, 
+                                         max_elems=cfg.max_num_batched_tokens * mc.hidden_size)
+                if TP_RANK == 0:
+                    print(f"[tinyserve] P2P all-reduce tuned: {TP_P2P.tuning}")
+            elif TP_RANK == 0:
+                warnings.warn("GPUs can't access each other's memory (no P2P), or this torch has no "
+                              "symmetric memory: using NCCL all-reduce")
+                
         # set max blocks per sequence (if our model supports lens upto 1024, and our
         # block size is 256, we can have at most 4 blocks)
         self.max_blocks_per_seq = -(-cfg.max_model_len // cfg.block_size)
@@ -1996,6 +2027,10 @@ class ModelRunner:
         """
         packed, mode, size = prepared
 
+        # for hang reports
+        self.last_launch = dict(mode=mode, size=size, requests=len(packed.seq_lens),
+                                tokens=len(packed.ids), at=time.strftime("%H:%M:%S"))
+
         # tensor parallel: the other GPUs must run this exact step too
         if TP_SIZE > 1:
             tp_broadcast(prepared)
@@ -2058,6 +2093,9 @@ def tp_worker(rank: int, cfg: Config, port: int):
     ### same setup as rank 0, meeting it at every collective inside ###
     ### num_blocks is not needed, rank 0 sends finished block tables every step ###
     runner, _ = build_runner(cfg)
+
+    # trigger a traceback
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     ### wait for rank 0 to broadcast the next inference step, run it, repeat ###
     while (step := tp_broadcast()) is not None:
@@ -2198,6 +2236,10 @@ def release_tensor_parallel(runner: ModelRunner):
     # counts as in use and destroy_process_group waits forever
     runner.graphs.clear()
     torch.cuda.synchronize()
+    global TP_P2P
+    if TP_P2P is not None:
+        TP_P2P.close()
+        TP_P2P = None
     dist.destroy_process_group()
 
 def stop_tensor_parallel(runner: ModelRunner):
@@ -2662,6 +2704,11 @@ class AsyncEngine:
         # daemon=True means this thread will automatically die if the main program exits.
         threading.Thread(target=self._loop, daemon=True).start()
 
+        # And one that reports and engine that stops making progress
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        threading.Thread(target=self._watchdog, daemon=True).start()
+        
+
     def _loop(self):
         """
         The main engine thread loop. It continuously checks for new web requests 
@@ -2705,6 +2752,13 @@ class AsyncEngine:
                 outputs = self.engine.step()
             except Exception:
                 traceback.print_exc()
+
+                if TP_SIZE > 1:
+                    print("[tinyserve] a step failed under tensor parallel: the GPUs are no longer in step, shutting down", flush=True)
+                    for p in TP_WORKERS:
+                        p.kill()
+                    os._exit(1)
+
                 continue
 
             # route the outputs back to the webserver
@@ -2723,6 +2777,33 @@ class AsyncEngine:
             if self.log_interval:
                 self.engine.maybe_log_stats(self.log_interval)
 
+    def _watchdog(self, stall: float = 60.0):
+        """
+        Requests running but no token prefilled or sampled for stall seconds
+        """
+        last, since, reported = None, time.time(), False
+        while True:
+            time.sleep(5)
+            e = self.engine
+            now = (e.num_prompt_tokens_run, e.num_generated_tokens)
+            if now != last or not e.has_work():
+                last, since, reported = now, time.time(), False
+                continue
+            if reported or time.time() - since < stall:
+                continue
+            reported = True
+            print(f"[tinyserve] WATCHDOG: no progress for {time.time() - since:.0f} s with "
+                  f"{len(e.scheduler.running)} running / {len(e.scheduler.waiting)} waiting requests. "
+                  f"Last step launched: {getattr(e.runner, 'last_launch', None)}", flush=True)
+            if TP_P2P is not None:
+                try:
+                    print(f"[tinyserve] WATCHDOG: P2P all-reduce state on rank 0: {TP_P2P.snapshot()}", flush=True)
+                except Exception as ex:
+                    print(f"[tinyserve] WATCHDOG: couldn't read the P2P all-reduce state: {ex!r}", flush=True)
+            print("[tinyserve] WATCHDOG: Python stacks, rank 0 then the workers:", flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            for p in TP_WORKERS:
+                os.kill(p.pid, signal.SIGUSR1)
     async def generate(self, prompt, params: SamplingParams):
         """
         Called by FastAPI for each user request. It acts as an async generator, 
@@ -2997,6 +3078,8 @@ def main():
                     help="triton: our paged attention kernel (tinykernels.py), torch: the slow reference")
     ap.add_argument("--no-triton-kernels", action="store_true",
                     help="use the plain torch ops instead of the fused Triton RMSNorm / RoPE / SwiGLU / MoE kernels")
+    ap.add_argument("--no-p2p-all-reduce", action="store_true", 
+                     help="-tp>1: use NCCL's all-reduce instead of ours")
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--max-num-seqs", type=int, default=256)
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
@@ -3012,15 +3095,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
-    cfg = Config(model=a.model, attention_backend=a.attention_backend,
+    cfg = Config(model=a.model, 
+                 attention_backend=a.attention_backend,
                  use_triton_kernels=not a.no_triton_kernels,
-                 max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
+                 max_model_len=a.max_model_len, 
+                 max_num_seqs=a.max_num_seqs,
                  max_num_batched_tokens=a.max_num_batched_tokens,
                  gpu_memory_utilization=a.gpu_memory_utilization,
                  use_cuda_graphs=not a.no_cuda_graphs,
                  enable_prefix_caching=not a.no_prefix_caching,
                  tensor_parallel_size=a.tensor_parallel_size,
-                 expert_parallel=a.expert_parallel)
+                 expert_parallel=a.expert_parallel,
+                 p2p_all_reduce=not a.no_p2p_all_reduce)
     engine = Engine(cfg)
     if a.command == "generate":
         out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,

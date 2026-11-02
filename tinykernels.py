@@ -1189,6 +1189,399 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_m: int, num_experts: int)
 
     return sorted_ids, expert_ids, padded_end[-1:].to(torch.int32)
 
+@triton.jit
+def _moe_align_place(
+    ids_ptr, 
+    sorted_ptr, 
+    expert_ids_ptr, 
+    total_ptr, 
+    counts, 
+    before, 
+    pid, 
+    numel, 
+    num_experts, 
+    BLOCK_M: tl.constexpr, 
+    NUM_BINS: tl.constexpr, 
+    SLICE: tl.constexpr, 
+    PLACE_BLOCK: tl.constexpr, 
+    TILES: tl.constexpr, 
+):
+    """
+    Build the padded expert layout and place this programs assignments
+
+    counts[e] -> total assignments belonging to expert e
+    before[e] -> assignments belonging to e in earlier program slices and used
+                 as our offsets of within expert assignments, you can see this 
+                 example in _moe_align_kernel
+ 
+    """
+    bins = tl.arange(0, NUM_BINS)
+    SPARE: tl.constexpr = NUM_BINS - 1
+
+    # pad each experts region to a multiple of BLOCK_M
+    padded = (counts + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    end = tl.cumsum(padded, 0)
+    bucket_start = end - padded
+
+    # only one worker needs to write our metadata
+    if pid == 0:
+
+        # num_post_padded
+        # padded = [4 4 4 0], used = 12
+        used = tl.sum(padded, 0)
+        tl.store(total_ptr, used)
+
+        # Fill each experts trailing padding with numel
+        # Each bucket has padded[e] - counts[e] unused rows at the end
+        # these rows get numel, an invalid assignment index (as valid is
+        # between 0 ... numel - 1). 
+        # For example, expert 1 has:
+        #   bucket_start = 4
+        #   counts = 2
+        #   padded = 4  
+        # this means in the possible locations [4 5 6 7], only [4 5] are real
+        # so positions 6, 7 should have our filler value numel
+        
+        # first our offset in the BLOCK_M tiles
+        r = tl.arange(0, BLOCK_M)
+
+        # The first padding row of each bucket starts at:
+        #   bucket_start + counts
+        # we get a matrix of rows[e, r] = bucket_start[e] + counts[e] + r
+        rows = (bucket_start + counts)[:, None] + r[None, :]
+
+        # only write to padding slots
+        tl.store(
+            sorted_ptr + rows,
+            numel,
+            mask=r[None, :] < (padded - counts)[:, None],
+        )
+
+        # assign an expert ID to every block_M sized tile
+        # Example
+        # end = [4, 8, 12, 12]
+        # end_tile: [1, 2, 3, 3]
+        # histogram(end_tile) = [0, 1, 1, 2, ...]
+        # cumsum(histogram) = [0, 1, 2, 4, ...]
+        # the final expert is 2, so tiles whoes expert ID >= 3
+        # are not local experts and recieve -1
+        #   torch: block_starts = torch.arange(0, max_padded, block_m) ###
+        #   torch: expert_ids = torch.searchsorted(padded_end, block_starts, right=True) ###
+        #   torch: expert_ids = torch.where(expert_ids >= num_experts, -1, expert_ids) ###
+        end_tile = tl.where(bins <= num_experts, end // BLOCK_M, TILES - 1)
+        expert = tl.cumsum(tl.histogram(end_tile, TILES), 0)
+        t = tl.arange(0, TILES)
+        tl.store(expert_ids_ptr + t, tl.where(expert >= num_experts, -1, expert), mask=t < used // BLOCK_M)
+
+    # track th enext available row for each expert, earlier program slices
+    # have already clamimed "before" rows
+    seen = bucket_start + before # offset from earlier block writes
+    poffs = tl.arange(0, PLACE_BLOCK)
+    my_start = pid * SLICE
+
+    # Process this program's assignments in PLACE_BLOCK-sized chunks.
+    for start in range(
+        my_start,
+        tl.minimum(my_start + SLICE, numel),
+        PLACE_BLOCK,
+    ):
+        o = start + poffs
+        mask = o < numel
+
+        e = tl.load(ids_ptr + o, mask=mask, other=0).to(tl.int32)
+        e = tl.where(e < 0, num_experts, e)
+        e = tl.where(o < numel, e, SPARE)
+
+        # Pairwise comparison, count earlier assignments with the same
+        # expert ID, preserving a stable order within each expert
+        # e = [1, 0, 1, 2]
+        # earlier_same =
+        #         [[0, 0, 0, 0],
+        #          [0, 0, 0, 0],
+        #          [1, 0, 0, 0],
+        #          [0, 0, 0, 0]]
+        #
+        # Summing each row gives the number of earlier assignments
+        # from the same expert.
+        earlier_same = (
+            (e[:, None] == e[None, :])
+            & (poffs[None, :] < poffs[:, None])
+        )
+
+        # bucket_start[e] tells us the satrt of e's padded region
+        # before[e] tells us assignment from earlier programs belonging to e
+        # earlier_same is assignemtns earlier in the CURRENT placemetn also belonging to e
+        # this is basically the stable ordering from earlier
+        dest = (
+            tl.gather(seen, e, 0)
+            + tl.sum(earlier_same.to(tl.int32), 1)
+        )
+
+        tl.store(sorted_ptr + dest, o, mask=o < numel)
+
+        # Advance the next available row for each expert
+        seen += tl.histogram(e, NUM_BINS)
+
+@triton.jit
+def _moe_align_kernel(
+    ids_ptr,         # [numel] expert id of each (token, slot) assignment, -1 = another GPU's
+    sorted_ptr,      # [max_padded] out: assignment indices grouped by expert, padding = numel
+    expert_ids_ptr,  # [max_padded / BLOCK_M] out: the expert of each BLOCK_M tile, -1 = skip it
+    total_ptr,       # [1] out: rows in use (num_post_padded)
+    numel,
+    num_experts,
+    BLOCK_M: tl.constexpr,
+    NUM_BINS: tl.constexpr,     # power of 2 > num_experts + 1: the experts, the remote bucket, and a spare
+    SLICE: tl.constexpr,        # assignments each program places 
+    PLACE_BLOCK: tl.constexpr,  # assignments per placing step 
+    TILES: tl.constexpr,        # power of 2 > the most tiles there can be
+):
+    """
+    moe_align_block_size in one launch
+
+    Every program places one SLICE of the assignments, and needs two things to know where:
+
+        counts: how many assignments each expert has in total -> where each expert's rows start
+        before: how many of each expert come in the slices AHEAD of mine -> which of those rows
+                earlier programs will will so mine goes after them
+
+    Both come from counting the whole input, which every program does for itself (its tiny and cached)
+    so the programs dont need to talk to each other
+
+    Example: flat = [1 0 1 2], 3 experts, BLOCK_M = 4, lets say SLICE = 2, so there are 2 programs
+
+        program 0 places assignment 0, 1 -> experts 1, 0
+        program 1 places assignment 2, 3 -> experts 1, 2
+
+        counts = [1, 2, 1] (expert 0 = 1, expert 1 = 2, expert 2 = 1), so after after padding
+        each expert to BLOCK_M (3 padding on expert 0, 2 padding on expert 1, 3 padding on expert 2)
+        the expert rows start at [0, 4, 8]. The before tells us within each expert assignments, what
+        is the offset.
+
+        Program 0: before = [0, 0, 0], nothing is before it
+                   assignment 0 expert (1) -> row 4 + 0 = 4, assignment 1 (expert 0) -> row 0
+        Program 1: before = [1, 1, 0], program 0's slice had one exert 0 and one expert 1
+                   assignment 2 (expert 1) -> row 4 + 1 = 5, assignment 3 (expert 2) -> row 8
+                   
+
+        That means between all the programs we write:
+
+        [1, P, P, P, 0, 2, P, P, 3, P, P, P], the same sorted_ids we built in torch!
+
+    """
+
+    pid = tl.program_id(0)
+    my_start = pid * SLICE
+    bins = tl.arange(0, NUM_BINS)
+    offs = tl.arange(0, SLICE)
+
+    ### NUM_BINS bins: one per local expert, then bin num_experts for remote experts (-1), then
+    ### unused bins and the last (SPARE) for things past the end of the input (like if we have
+    ### numel of 10, but our SLICE is 8, so the second chunk would process from 8 - 16, and anything
+    ### after 10 is invalid)
+    SPARE: tl.constexpr = NUM_BINS - 1
+
+    counts = tl.zeros([NUM_BINS], dtype=tl.int32)
+    before = tl.zeros([NUM_BINS], dtype=tl.int32)
+
+    ### Program 1 of the example walks the input in chunks of SLICE: ###
+    ###   start 0: e = [1, 0], h = [1, 1, 0]  counts = [1, 1, 0]  before = [1, 1, 0]  (0 < 2: ahead of me) ###
+    ###   start 2: e = [1, 2], h = [0, 1, 1]  counts = [1, 2, 1]  before = [1, 1, 0]  (my own slice) ###
+    for start in range(0, numel, SLICE):
+        o = start + offs # offset over to the slice of the assignments we are processing
+        mask = o < numel  # any position past the actual numel (token, slot combos) is invalid
+        e = tl.load(ids_ptr + o, mask=mask, other=0.0).to(tl.int32)
+        e = tl.where(e < 0, num_experts, e) # -1 becomes its own bin (num_experts) as valid experts are 0 ... E-1
+        h = tl.histogram(tl.where(mask, e, SPARE), NUM_BINS) # chunk count per expert
+        counts += h # every chunk accumulates to the total
+        before += tl.where(start < my_start, h, 0) # only chunks before my slice (before += h if start < my_start)
+    counts = tl.where(bins == SPARE, 0, counts) # remove anything past our valid assignments
+
+    _moe_align_place(ids_ptr, sorted_ptr, expert_ids_ptr, total_ptr, counts, before, pid, numel,
+                     num_experts, BLOCK_M, NUM_BINS, SLICE, PLACE_BLOCK, TILES)
+
+@triton.jit
+def _moe_slice_count_kernel(
+    ids_ptr, # [numel] 
+    hist_ptr,  # [programs x NUM_BINS]
+    numel, 
+    num_experts, 
+    NUM_BINS: tl.constexpr, 
+    SLICE: tl.constexpr
+):
+    """
+    Large input path, identical to :
+        torch: flat = torch.where(flat < 0, num_experts, flat)
+        torch: counts.scatter_add_(0, flat, torch.ones_like(flat))  
+    """
+    # which worker?
+    pid = tl.program_id(0)
+
+    # offset over to the slice
+    o = pid * SLICE + tl.arange(0, SLICE)
+
+    # get the expert id
+    e = tl.load(ids_ptr + o, mask=o < numel, other=0).to(tl.int32)
+
+    # mask invalid experts
+    e = tl.where(e < 0, num_experts, e)
+
+    # compute the histogram per slice
+    h = tl.histogram(tl.where(o < numel, e, NUM_BINS - 1), NUM_BINS)
+
+    # store results
+    tl.store(hist_ptr + pid * NUM_BINS + tl.arange(0, NUM_BINS), h)
+
+@triton.jit
+def _moe_align_from_counts_kernel(
+    ids_ptr, sorted_ptr, expert_ids_ptr, total_ptr,    # as for _moe_align_kernel
+    hist_ptr,        # [programs x NUM_BINS] from _moe_slice_count_kernel
+    num_programs,
+    numel,
+    num_experts,
+    BLOCK_M: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    SLICE: tl.constexpr,
+    PLACE_BLOCK: tl.constexpr,
+    TILES: tl.constexpr,
+    PROGRAMS_P2: tl.constexpr,  # power of 2 >= num_programs
+):
+    """
+    Compute our counts and before so we can reuse the _moe_align_place method
+    """
+    pid = tl.program_id(0)
+    bins = tl.arange(0, NUM_BINS)
+    p = tl.arange(0, PROGRAMS_P2)[:, None]
+    hist = tl.load(hist_ptr + p * NUM_BINS + bins[None, :], mask=p < num_programs, other=0)
+    counts = tl.where(bins == NUM_BINS - 1, 0, tl.sum(hist, 0))
+    before = tl.sum(tl.where(p < pid, hist, 0), 0)
+
+    _moe_align_place(ids_ptr, sorted_ptr, expert_ids_ptr, total_ptr, counts, before, pid, numel,
+                     num_experts, BLOCK_M, NUM_BINS, SLICE, PLACE_BLOCK, TILES)
+    
+def moe_align_block_size_triton(topk_ids: torch.Tensor, block_m: int, num_experts: int):
+    """
+    Fused replacement for original moe_align_block_size_triton
+
+    The challenge we have here is we need to launch a full count over the assignments 
+    first before the rest can happen. So there are two options:
+
+        1) every worker can run its own full count and then do the rest (ideal when
+           we have less tokens but becomes expensive as it grows) 
+        2) we launch a count first and then a second launch to do the rest (ideal for
+           when we have lots of tokens, but adds latency during small batch decoding)
+
+    I ran a quick measurement and found (on my system) with topk=8
+
+        tokens              1      4      8     16     24     32     40     48     64    128    256   2048
+        assignments         8     32     64    128    192    256    320    384    512   1024   2048  16384
+        one kernel        3.3    3.1    3.6    4.4    4.8    5.2    5.6    5.9    6.7   11.3   12.2   33.4
+        two kernels       4.4    4.4    4.9    5.1    5.2    5.2    5.3    5.3    5.4    7.6    9.5   13.5
+
+    So we will have two paths, if we have more than 256 assignments we will use
+    the two kernel apporach, otherwise we just use 1 kernel
+
+    """
+
+    # Get starting information about the data and shape
+    numel = topk_ids.numel()
+    num_buckets = num_experts + 1
+    max_padded = triton.cdiv(numel + num_buckets * (block_m - 1), block_m) * block_m
+    dev = topk_ids.device
+
+    # Places to store results
+    sorted_ids = torch.empty(max_padded, dtype=torch.int32, device=dev)
+    expert_ids = torch.empty(max_padded // block_m, dtype=torch.int32, device=dev)
+    total = torch.empty(1, dtype=torch.int32, device=dev)
+
+    # num bins include num_experts bins + 1 remote bin (for -1) + 1 spare bin (for padding)
+    num_bins = triton.next_power_of_2(num_experts + 2)
+    tiles = triton.next_power_of_2(max_padded // block_m + 1)
+
+    # if our total assignments is less than 256, run it in one kernel
+    if numel < 256:
+        # slice is how many consecutive assignments each program owns. First, it determines ownership
+        # on the grid, for example, lets say numel = 256 and slice = 64, there are then 4 programs
+        # [0...63][64...127][128...191][192...255]
+        # We set the slice cannot be larger than 512 assignments, we try to get 16 programs with atleats
+        # 64 each, or we can just 1 slice that holds everything in the smallest cases 
+        slice_ = min(512,                                   # C: hard cap
+             max(64, triton.next_power_of_2(numel // 16)),  # B: aim for ~16 programs, each at least 64
+             max(16, triton.next_power_of_2(numel)))        # A: one slice that holds the whole input
+
+        # trigger kernel
+        _moe_align_kernel[(triton.cdiv(numel, slice_),)](
+            topk_ids, sorted_ids, expert_ids, total, numel, num_experts,
+            BLOCK_M=block_m, NUM_BINS=num_bins, SLICE=slice_, PLACE_BLOCK=min(32, slice_), TILES=tiles,
+            num_warps=4)
+        
+        return sorted_ids, expert_ids, total
+
+    # if we have more thatn 256 assignments, we will run it in 2 kernels. First we will do upto 
+    # 64 programs of of atleast 32 each
+    slice_ = max(32, triton.next_power_of_2(triton.cdiv(numel, 64)))
+    programs = triton.cdiv(numel, slice_)
+    hist = torch.empty(programs, num_bins, dtype=torch.int32, device=dev)
+    _moe_slice_count_kernel[(programs,)](topk_ids, hist, numel, num_experts,
+                                         NUM_BINS=num_bins, SLICE=slice_, num_warps=4)
+    _moe_align_from_counts_kernel[(programs,)](
+        topk_ids, sorted_ids, expert_ids, total, hist, programs, numel, num_experts,
+        BLOCK_M=block_m, NUM_BINS=num_bins, SLICE=slice_, PLACE_BLOCK=32, TILES=tiles,
+        PROGRAMS_P2=triton.next_power_of_2(programs), num_warps=4)
+
+    return sorted_ids, expert_ids, total
+
+@triton.jit
+def _moe_route_kernel(
+    logits_ptr,      # [T x E] router logits
+    expert_map_ptr,  # [E] global expert id -> id on this GPU (-1: another GPU's)
+    weights_ptr,     # [T x TOP_K] out, fp32
+    ids_ptr,         # [T x TOP_K] out, int32, local ids
+    E,
+    stride,
+    TOP_K: tl.constexpr,
+    RENORM: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    softmax over the experts, keep the TOP_K largest, optionally renormalize them to sum to 1
+    """
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_E)
+    koffs = tl.arange(0, BLOCK_K)
+
+    ### softmax numerators in fp32 (the denominator only matters without renormalizing) ###
+    x = tl.load(logits_ptr + row * stride + offs, mask=offs < E, other=float("-inf")).to(tl.float32)
+    p = tl.exp(x - tl.max(x, 0))
+
+    ### top-k by repeated argmax: take the largest, knock it out, repeat (largest first, like topk) ###
+    w = tl.zeros([BLOCK_K], dtype=tl.float32)
+    ids = tl.zeros([BLOCK_K], dtype=tl.int32)
+    q = p
+    for k in tl.static_range(TOP_K):
+        i = tl.argmax(q, 0)
+        w = tl.where(koffs == k, tl.max(q, 0), w)
+        ids = tl.where(koffs == k, i, ids)
+        q = tl.where(offs == i, -1.0, q)
+
+    w = w / (tl.sum(w, 0) if RENORM else tl.sum(p, 0))
+    ids = tl.load(expert_map_ptr + ids).to(tl.int32)
+    tl.store(weights_ptr + row * TOP_K + koffs, w, mask=koffs < TOP_K)
+    tl.store(ids_ptr + row * TOP_K + koffs, ids, mask=koffs < TOP_K)
+
+def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool, expert_map: torch.Tensor):
+    """
+    logits [T, E] -> topk_weights [T, top_k], topk_ids [T, top_k]
+    """
+    T, E = logits.shape
+    weights = torch.empty(T, top_k, dtype=torch.float32, device=logits.device)
+    ids = torch.empty(T, top_k, dtype=torch.int32, device=logits.device)
+    _moe_route_kernel[(T,)](logits, expert_map, weights, ids, E, logits.stride(0),
+                            TOP_K=top_k, RENORM=renormalize, BLOCK_E=triton.next_power_of_2(E),
+                            BLOCK_K=triton.next_power_of_2(top_k), num_warps=4)
+    return weights, ids
+
 @triton.autotune(configs=[triton.Config({"BLOCK_N": bn, "BLOCK_K": bk}, num_warps=w, num_stages=s)
                           for bn in (64, 128) for bk in (32, 64) for w in (4, 8) for s in (2, 3, 4)],
                  key=["N", "K", "BLOCK_M"])
@@ -1371,8 +1764,8 @@ def _moe_gemm(a, w, c, topk_weights, sorted_ids, expert_ids, num_post_padded,
         BLOCK_M=block_m, GROUP_M=8, TOP_K=top_k, MUL_ROUTED_WEIGHT=mul_weight,
     )
 
-def fused_moe(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
-              topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+def fused_moe(x, w13, w2, topk_weights, topk_ids, sum_topk=True):
+
     """
     x [T, H], w13 [E, 2I, H] (gate rows then up rows), w2 [E, H, I],
     topk_weights / topk_ids [T, top_k] (ids local to this GPU, -1 = another GPU's).
@@ -1384,7 +1777,7 @@ def fused_moe(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
 
     ### decode: few rows per expert, so a tall tile would be mostly padding ###
     block_m = 16 if T * top_k <= 4 * E else 64
-    sorted_ids, expert_ids, num_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    sorted_ids, expert_ids, num_post_padded = moe_align_block_size_triton(topk_ids, block_m, E)
     topk_weights = topk_weights.to(torch.float32).flatten()
 
     ### GEMM 1: every (token, slot) row through its expert's gate|up ###
@@ -1400,7 +1793,7 @@ def fused_moe(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
               1, True, block_m)
 
     ### each token's top_k rows are adjacent: sum them ###
-    return out.view(T, top_k, H).sum(1)
+    return out.view(T, top_k, H).sum(1) if sum_topk else out
 
 @torch.inference_mode()
 def autotune_fused_moe(w13: torch.Tensor, w2: torch.Tensor, top_k: int, max_num_tokens: int):
