@@ -12,11 +12,13 @@ import asyncio
 import atexit
 import copy
 import datetime
+import faulthandler
 import glob
 import json
 import os
 import queue
 import re
+import signal
 import socket
 import threading
 import time
@@ -50,6 +52,7 @@ except:
 
 try:
     import tinykernels as tk
+    import tinycomm as tc
     TRITON_KERNELS_AVAILABLE = True
 except Exception:
     TRITON_KERNELS_AVAILABLE = False
@@ -60,6 +63,7 @@ TRITON_KERNELS = True   # layers call the fused kernels in tinykernels.py instea
 ATTN_META = None         # AttnMetadata for this step, None during the memory profiling run
 TP_RANK, TP_SIZE = 0, 1  # By default we use rank 0 with 1 worker.
 TP_CPU_GROUP = None      # gloo (CPU) group used to broadcast python objects each step
+TP_P2P = None            # tc.P2PAllReduce when cfg.p2p_all_reduce, else tp_all_reduce uses NCCL
 TP_WORKERS: list = []    # rank 0 only: the worker processes, so /health can notice one dying
 COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
 ROW_PARALLEL = ("o_proj", "down_proj")
@@ -87,6 +91,7 @@ class Config:
 
     tensor_parallel_size: int = 1 # split dense layers like Megatron
     expert_parallel: bool = False # MoE under tp > 1: whole experts per GPU instead of slicing every expert
+    p2p_all_reduce: bool = True # tp > 1: our all-reduce over NVLink/P2P (tinycomm.py) instead of NCCL
 
 
     def __post_init__(self):
@@ -100,6 +105,10 @@ class Config:
             if self.attention_backend == "triton":
                 self.attention_backend = "flash_attn" if FLASH_ATTN_AVAILABLE else "torch"
             self.use_triton_kernels = False
+
+        # the P2P all-reduce is one of the Triton kernels: --no-triton-kernels means NCCL
+        if not self.use_triton_kernels:
+            self.p2p_all_reduce = False
 
         # set page size as small as possible based on backend
         if self.block_size == 0:
@@ -781,6 +790,9 @@ def tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     Both workers receive the complete output y.
     """
     if TP_SIZE > 1:
+        # if it fits launch it on our own P2P comm
+        if TP_P2P is not None and TP_P2P.fits(x):
+            return TP_P2P(x)
         dist.all_reduce(x)
     return x
 
@@ -839,11 +851,24 @@ class Attention(nn.Module):
 
         ### Optionally use triton kernels for fused ops ###
         if TRITON_KERNELS:
-            # q/k norm and both rotary embeddings in one kernel, in place
+            ### q/k norm and rotary embeds in one kernel inplace. Once there is 
+            ### a KVCache (not during any profiling runs), the same kernel
+            ### will also write to this steps K,V directly
+            meta = ATTN_META
+            cache_args = {}
+            if meta is not None:
+                cache_args = {
+                    "v": v, 
+                    "k_cache": self.kv_cache[0],
+                    "v_cache": self.kv_cache[1],
+                    "slot_mapping": meta.slot_mapping
+                }
+
             tk.qk_norm_rope(q, k, cos, sin,
                             self.q_norm.weight if self.qk_norm else None,
                             self.k_norm.weight if self.qk_norm else None,
-                            self.q_norm.eps if self.qk_norm else 0.0)
+                            self.q_norm.eps if self.qk_norm else 0.0,
+                            **cache_args)
         else:
             if self.qk_norm:
                 q, k = self.q_norm(q), self.k_norm(k)
@@ -871,9 +896,12 @@ class Attention(nn.Module):
 
         # Write this step's new K/V into the page pool before attention
         # (slot_mapping has one slot per token, padding tokens go to the null page 0)
+        # if using triton kernels, then this was already fused in earlier
         k_cache, v_cache = self.kv_cache[0], self.kv_cache[1]
-        k_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, k)
-        v_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, v)
+
+        if not TRITON_KERNELS:
+            k_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, k)
+            v_cache.view(-1, self.Hkv, self.D).index_copy_(0, meta.slot_mapping, v)
 
         return ATTN_FN(q, k_cache, v_cache, meta, self.D ** -0.5)
 
@@ -1046,6 +1074,18 @@ class SparseMoE(nn.Module):
         return True
 
     def forward(self, x):
+        if TRITON_KERNELS:
+            ### the routing below in one kernel, then the fused expert GEMMs ###
+            topk_weights, topk_ids = tk.moe_route(self.gate(x), self.top_k, self.norm_topk_prob,
+                                                  self.expert_map)
+
+            # tensor parallel with our all-reduce: it sums each token's top_k expert rows too
+            # one kernel instead of fused_moe's sum and then the all-reduce
+            if TP_P2P is not None and TP_P2P.fits(x, 1):
+                rows = tk.fused_moe(x, self.w13, self.w2, topk_weights, topk_ids, sum_topk=False)
+                return TP_P2P(rows, topk=self.top_k)
+            return tp_all_reduce(tk.fused_moe(x, self.w13, self.w2, topk_weights, topk_ids))
+
         ### route: softmax over all experts, keep the top_k, optionally renormalize them ###
         probs = self.gate(x).float().softmax(-1)
         topk_weights, topk_ids = probs.topk(self.top_k, dim=-1)
@@ -1055,11 +1095,8 @@ class SparseMoE(nn.Module):
         ### global ids -> local ids (-1 for other GPUs' experts under EP) ###
         topk_ids = self.expert_map[topk_ids]
 
-        ### pick between options
-        moe = tk.fused_moe if TRITON_KERNELS else moe_reference
-
         ### all reduce between GPUs
-        return tp_all_reduce(moe(x, self.w13, self.w2, topk_weights, topk_ids))
+        return tp_all_reduce(moe_reference(x, self.w13, self.w2, topk_weights, topk_ids))
 
 class DecoderLayer(nn.Module):
     def __init__(self, cfg, i):
@@ -1162,14 +1199,21 @@ class Model(nn.Module):
         super().__init__()
 
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+
+        # Under tensor parallel, each GPU only stores its slice of the embedding table
+        # just like lm_head later. We can split and then all reduce after
+        self.embed_tokens = nn.Embedding(-(-cfg.vocab_size // TP_SIZE), cfg.hidden_size)
 
         self.layers = nn.ModuleList(DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.tie = getattr(cfg, "tie_word_embeddings", False)
 
         if not self.tie:
-            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+            ### If the weights arent tied we need a separate lm head (typical for larger models)
+            ### Also if tensor parallel, each worker will be responsible for a part of the 
+            ### vocabulary (otherwise the full load only falls on rank 0) 
+            per_rank_output = -(-cfg.vocab_size // TP_SIZE) # ceiling division
+            self.lm_head = nn.Linear(cfg.hidden_size, per_rank_output, bias=False)
 
         # RoPE table indexed by absolute position
         rope = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
@@ -1183,63 +1227,170 @@ class Model(nn.Module):
         self.register_buffer("cos", freqs.cos().float(), persistent=False)
         self.register_buffer("sin", freqs.sin().float(), persistent=False)
 
+    def embed(self, input_ids):
+        """
+        With Tensor Parallel no GPU has the whole table, so each one looks up
+        the tokens in its own slice and leaves zero everywhere else. The all-reduce
+        then adds them up to get the full embedding everywhere. This mainly saves
+        some per-gpu memory as each doesn't need to store the full table
+        """
+
+        if TP_SIZE == 1:
+            return self.embed_tokens(input_ids)
+
+        # the token ids this gpu holds are from lo to lo + n
+        n = self.embed_tokens.num_embeddings
+        lo = TP_RANK * n
+        mine = (input_ids >= lo) & (input_ids < lo + n)
+
+        # offset to start at 0 (clamp just keeps the other gpus indexes in bound)
+        # but of course they will be garbage data so we multiply by the mask, 
+        # zeroing out all the positions this GPU is not responsible for
+        x = self.embed_tokens((input_ids - lo).clamp(0, n-1)) * mine.unsqueeze(-1)
+
+        return tp_all_reduce(x)
+
     def forward(self, input_ids, positions):
         cos, sin = self.cos[positions], self.sin[positions]
-        x, residual = self.embed_tokens(input_ids), None
+        x, residual = self.embed(input_ids), None
         for layer in self.layers:
             x, residual = layer(x, residual, cos, sin)
         return add_rmsnorm(self.norm, x, residual)[0]     # the last residual add + final norm
 
     def logits(self, hidden):
-        ### separate method to get logis
-        w = self.embed_tokens.weight if self.tie else self.lm_head.weight
-        return hidden @ w.t()
+        ### method to get logits
+        if TP_SIZE == 1:
+            return hidden @ self.embed_tokens.weight.t() if self.tie else self.lm_head(hidden)
 
-def load_model(name: str, dtype, max_position: int, tp_rank: int = 0, tp_size: int = 1,
-               expert_parallel: bool = False):
-    """quick helper method to load weights into our model (this rank's shard of them)"""
+        ### If distributed, each rank predicts its own chunk of the vocab (for each token)
+        ### and if we have 2 gpus, each GPU predcts half the vocab that needs to be gathered
+        V = self.cfg.vocab_size
+        n = -(-V//TP_SIZE) # ceiling div
+
+        ### If weights are tied, this is easy, this GPU already only contains this slice of 
+        ### the vocabularize size, so just multiply and move on!
+        if self.tie:
+            part = hidden @ self.embed_tokens.weight.t()
+
+        ### If the LM Head doesnt share weights then those weights have been split, and
+        ### if our goal is the final [T x V], each gpu has a portion of those V (zeroed out)
+        ### for invalid locations
+        else:
+            part = self.lm_head(hidden)
+
+        ### Each rank now has [T x ceil(V/TP_SIZE)] outputs, we need to concat on the last dimension
+        ### So rank 0 (responsible for sampling) has the full vocab size
+        parts = part.new_empty(TP_SIZE, *part.shape)
+        dist.all_gather_into_tensor(parts, part.contiguous())
+
+        ### [GPU, row, slice] -> [row, GPU * slice] = [row, vocab].
+        return parts.permute(1,0,2).reshape(part.shape[0], TP_SIZE * n)[:, :V] # clipped to actual vocabulary
+
+def load_model(name, 
+               dtype, 
+               max_position, 
+               tp_rank = 0, 
+               tp_size = 1, 
+               expert_parallel=False
+):
+    """
+    Helper method to load weights into the model (this ranks shard of them)
+    """
+
     path = name if os.path.isdir(name) else snapshot_download(
-        name, allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"])
+        name, allow_patterns=["*.json", "tokenizer*", "*.txt", "*.safetensors"]
+    )
+
     cfg = AutoConfig.from_pretrained(path)
-    assert cfg.model_type in SUPPORTED_MODELS, \
-        f"model_type {cfg.model_type!r} isn't supported, these are: {SUPPORTED_MODELS}"
+    assert cfg.model_type in SUPPORTED_MODELS, f"model_type {cfg.model_type!r} isn't supported, these are: {SUPPORTED_MODELS}"
+
     if tp_size > 1:
         cfg = shard_config(cfg, tp_size, tp_rank, expert_parallel)
+
+    # load model in our wanted dtype
     torch.set_default_dtype(dtype)
     with torch.device("cuda"):
         model = Model(cfg, max_position)
+
+    # set back to the standard float32
     torch.set_default_dtype(torch.float32)
     params = dict(model.named_parameters())
     loaded, unused = set(), []
+
+    def assign(path, attr, src, rows=None):
+        # path: lm_head
+        # attr: weight
+        # src: tensor to copy in
+        # rows: what row indexed to copy into   
+
+        # search for a key like "lm_head"
+        module = model.get_submodule(path)
+
+        # what are the assigned rows
+        r = rows if rows is not None else slice(None)
+
+        # basically lm_head.weight[rows] = src inplace
+        getattr(module, attr)[r].copy_(src)
+
+        # remember it was filled, so we can check nothing was missed at the end
+        loaded.add(f"{path}.{attr}")
+
+    def load_tensor(fh, key):
+        # one checkpoint tensor (this GPU's slice of it) into the model
+        name_ = key.removeprefix("model.")
+
+        ### MoE: separate tensors per expert go into the layer's stacked w13 / w2 ###
+        if m := EXPERT_KEY.fullmatch(name_):
+            moe = model.layers[int(m[1])].mlp
+            if moe.load_expert(int(m[2]), m[3], fh, key, tp_rank, tp_size):
+                loaded.add(f"layers.{m[1]}.mlp.{'w2' if m[3] == 'down_proj' else 'w13'}")
+
+        ### q/k/v and gate/up: each goes into its row range of the fused projection.
+        ### load_shard still sees the original name, so under tensor parallelism it
+        ### returns THIS GPU's slice of q (or k, ...), and each GPU's fused weight
+        ### ends up [its q heads; its k heads; its v heads], never a cut of the stack
+        elif m := FUSED_KEY.fullmatch(name_):
+            module = model.get_submodule(m[1])
+            fused, part = FUSED_PARTS[m[2]]
+            sizes = module.qkv_sizes if fused == "qkv_proj" else module.gate_up_sizes
+            start = sum(sizes[:part])
+            assign(f"{m[1]}.{fused}", m[3], load_shard(fh, key, tp_rank, tp_size),
+                   rows=slice(start, start + sizes[part]))
+
+        ### lm_head under tensor parallel: this GPU's rows of the vocabulary. The last ###
+        ### GPU's slice can be short; its spare rows stay zero, and Model.logits ###
+        ### drops their scores ###
+        elif name_ == "lm_head.weight" and tp_size > 1 and not model.tie:
+            sl = fh.get_slice(key)
+            n = model.lm_head.out_features
+            lo, hi = tp_rank * n, min((tp_rank + 1) * n, sl.get_shape()[0])
+            model.lm_head.weight.zero_()
+            assign("lm_head", "weight", sl[lo:hi], rows=slice(0, hi - lo))
+
+        ### Embeddings can also be split up
+        elif tp_size > 1 and (name_ == "embed_tokens.weight" or (name_ == "lm_head.weight" and not model.tie)):
+            module = name_.removesuffix(".weight")
+            weight = model.get_submodule(module).weight
+            sl = fh.get_slice(key)
+            n = weight.shape[0]
+            lo, hi = tp_rank * n, min((tp_rank + 1) * n, sl.get_shape()[0])
+            weight.zero_()
+            assign(module, "weight", sl[lo:hi], rows=slice(0, hi - lo))
+
+        # everything else: a parameter with the same name (norms, embedding, o_proj, ...)
+        elif name_ in params:
+            path, _, attr = name_.rpartition(".")
+            assign(path, attr, load_shard(fh, key, tp_rank, tp_size))
+
+        # the checkpoint has it, we don't (e.g. lm_head.weight on a tied model)
+        else:
+            unused.append(key)
+
     with torch.no_grad():
         for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
             with safe_open(f, "pt", device=f"cuda:{torch.cuda.current_device()}") as fh:
                 for key in fh.keys():
-                    name_ = key.removeprefix("model.")
-
-                    ### MoE: separate tensors per expert go into the layer's stacked w13 / w2 ###
-                    if m := EXPERT_KEY.fullmatch(name_):
-                        moe = model.layers[int(m[1])].mlp
-                        if moe.load_expert(int(m[2]), m[3], fh, key, tp_rank, tp_size):
-                            loaded.add(f"layers.{m[1]}.mlp.{'w2' if m[3] == 'down_proj' else 'w13'}")
-
-                    ### q/k/v and gate/up: each goes into its row range of the fused projection.
-                    ### load_shard still sees the original name, so under tensor parallelism it
-                    ### returns THIS GPU's slice of q (or k, ...), and each GPU's fused weight
-                    ### ends up [its q heads; its k heads; its v heads], never a cut of the stack
-                    elif m := FUSED_KEY.fullmatch(name_):
-                        module = model.get_submodule(m[1])
-                        fused, part = FUSED_PARTS[m[2]]
-                        sizes = module.qkv_sizes if fused == "qkv_proj" else module.gate_up_sizes
-                        start = sum(sizes[:part])
-                        getattr(getattr(module, fused), m[3])[start:start + sizes[part]].copy_(
-                            load_shard(fh, key, tp_rank, tp_size))
-                        loaded.add(f"{m[1]}.{fused}.{m[3]}")
-                    elif name_ in params:
-                        params[name_].copy_(load_shard(fh, key, tp_rank, tp_size))
-                        loaded.add(name_)
-                    else:
-                        unused.append(key)
+                    load_tensor(fh, key)
 
     ### a weight the checkpoint never filled would silently stay random, so fail loudly ###
     ### (usually a new architecture whose names don't match ours) ###
@@ -1460,6 +1611,11 @@ class ModelRunner:
         self.cfg = cfg
         torch.manual_seed(cfg.seed)
 
+        # Memory other processes may hold on this GPU measured before we allocate anything
+        # or run any forward pass 
+        free, total = torch.cuda.mem_get_info()
+        self.used_by_others = total - free
+
         t = time.time()
         self.model = load_model(
             cfg.model, cfg.dtype, cfg.max_model_len, TP_RANK, TP_SIZE, cfg.expert_parallel
@@ -1492,10 +1648,20 @@ class ModelRunner:
             "triton": triton_attention,
         }
 
-        global ATTN_FN, TRITON_KERNELS
+        global ATTN_FN, TRITON_KERNELS, TP_P2P
         ATTN_FN = ATTENTION_BACKENDS[cfg.attention_backend]
         TRITON_KERNELS = cfg.use_triton_kernels
 
+        if TP_SIZE > 1 and cfg.p2p_all_reduce:
+            if tc.P2PAllReduce.supported(TP_SIZE):
+                TP_P2P = tc.P2PAllReduce(TP_CPU_GROUP, TP_RANK, TP_SIZE, 
+                                         max_elems=cfg.max_num_batched_tokens * mc.hidden_size)
+                if TP_RANK == 0:
+                    print(f"[tinyserve] P2P all-reduce tuned: {TP_P2P.tuning}")
+            elif TP_RANK == 0:
+                warnings.warn("GPUs can't access each other's memory (no P2P), or this torch has no "
+                              "symmetric memory: using NCCL all-reduce")
+                
         # set max blocks per sequence (if our model supports lens upto 1024, and our
         # block size is 256, we can have at most 4 blocks)
         self.max_blocks_per_seq = -(-cfg.max_model_len // cfg.block_size)
@@ -1592,11 +1758,14 @@ class ModelRunner:
         # other = bytes held by someone else (or untracked)
         peak = torch.cuda.max_memory_allocated()
         free, total = torch.cuda.mem_get_info()
-        other = total - free - torch.cuda.memory_reserved()
+        reserved = torch.cuda.memory_reserved()
+        untracked = max(0, total - free - reserved - self.used_by_others)
 
-        # Leave (1 - gpu_memory_utilization) headroom, don't steal other,
-        # and keep peak free so the next real forward still fits beside the cache.
-        budget = total * self.cfg.gpu_memory_utilization - other - peak
+        # Our share of the card, minus what we already use
+        budget = total * self.cfg.gpu_memory_utilization - untracked - peak
+
+        # Never allocate more than is actually free though
+        budget = min(budget, free + reserved - peak)
 
         # Bytes for one page id across every layer:
         #   2 (K and V) * L * tokens/page * Hkv * D * 2 bytes (fp16/bf16)
@@ -1891,16 +2060,22 @@ class ModelRunner:
         """
         packed, mode, size = prepared
 
+        # for hang reports
+        self.last_launch = dict(mode=mode, size=size, requests=len(packed.seq_lens),
+                                tokens=len(packed.ids), at=time.strftime("%H:%M:%S"))
+
         # tensor parallel: the other GPUs must run this exact step too
         if TP_SIZE > 1:
             tp_broadcast(prepared)
 
+        return self.forward_logits(packed, mode, size)
+
+    @torch.inference_mode()
+    def forward_logits(self, packed: PackedBatch, mode: str, size: int | None):
+        """The forward pass, then the logits of each real request's last query (every rank)"""
         hidden = self.forward_step(packed, mode, size)
-
-        # hidden is  packed [T, ...], logit_rows indexes the last query of
-        # each real request, and graph padding is skipped. 
-        return self.model.logits(hidden[to_gpu(packed.logit_rows, torch.int64)])
-
+        return self.model.logits(hidden[to_gpu(packed.logit_rows, torch.int64)]) 
+    
     @torch.inference_mode()
     def launch_sample(self, batch: list[ScheduledRequest], logits: torch.Tensor) -> torch.cuda.Event:
         """
@@ -1952,9 +2127,12 @@ def tp_worker(rank: int, cfg: Config, port: int):
     ### num_blocks is not needed, rank 0 sends finished block tables every step ###
     runner, _ = build_runner(cfg)
 
+    # trigger a traceback
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+
     ### wait for rank 0 to broadcast the next inference step, run it, repeat ###
     while (step := tp_broadcast()) is not None:
-        runner.forward_step(*step)
+        runner.forward_logits(*step)
 
     ### stop_tensor_parallel() on rank 0 broadcast None. Release this process's ###
     ### own resources, the same way rank 0 does ###
@@ -2091,6 +2269,10 @@ def release_tensor_parallel(runner: ModelRunner):
     # counts as in use and destroy_process_group waits forever
     runner.graphs.clear()
     torch.cuda.synchronize()
+    global TP_P2P
+    if TP_P2P is not None:
+        TP_P2P.close()
+        TP_P2P = None
     dist.destroy_process_group()
 
 def stop_tensor_parallel(runner: ModelRunner):
@@ -2555,6 +2737,11 @@ class AsyncEngine:
         # daemon=True means this thread will automatically die if the main program exits.
         threading.Thread(target=self._loop, daemon=True).start()
 
+        # And one that reports and engine that stops making progress
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        threading.Thread(target=self._watchdog, daemon=True).start()
+        
+
     def _loop(self):
         """
         The main engine thread loop. It continuously checks for new web requests 
@@ -2598,6 +2785,13 @@ class AsyncEngine:
                 outputs = self.engine.step()
             except Exception:
                 traceback.print_exc()
+
+                if TP_SIZE > 1:
+                    print("[tinyserve] a step failed under tensor parallel: the GPUs are no longer in step, shutting down", flush=True)
+                    for p in TP_WORKERS:
+                        p.kill()
+                    os._exit(1)
+
                 continue
 
             # route the outputs back to the webserver
@@ -2616,6 +2810,33 @@ class AsyncEngine:
             if self.log_interval:
                 self.engine.maybe_log_stats(self.log_interval)
 
+    def _watchdog(self, stall: float = 60.0):
+        """
+        Requests running but no token prefilled or sampled for stall seconds
+        """
+        last, since, reported = None, time.time(), False
+        while True:
+            time.sleep(5)
+            e = self.engine
+            now = (e.num_prompt_tokens_run, e.num_generated_tokens)
+            if now != last or not e.has_work():
+                last, since, reported = now, time.time(), False
+                continue
+            if reported or time.time() - since < stall:
+                continue
+            reported = True
+            print(f"[tinyserve] WATCHDOG: no progress for {time.time() - since:.0f} s with "
+                  f"{len(e.scheduler.running)} running / {len(e.scheduler.waiting)} waiting requests. "
+                  f"Last step launched: {getattr(e.runner, 'last_launch', None)}", flush=True)
+            if TP_P2P is not None:
+                try:
+                    print(f"[tinyserve] WATCHDOG: P2P all-reduce state on rank 0: {TP_P2P.snapshot()}", flush=True)
+                except Exception as ex:
+                    print(f"[tinyserve] WATCHDOG: couldn't read the P2P all-reduce state: {ex!r}", flush=True)
+            print("[tinyserve] WATCHDOG: Python stacks, rank 0 then the workers:", flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            for p in TP_WORKERS:
+                os.kill(p.pid, signal.SIGUSR1)
     async def generate(self, prompt, params: SamplingParams):
         """
         Called by FastAPI for each user request. It acts as an async generator, 
@@ -2890,6 +3111,8 @@ def main():
                     help="triton: our paged attention kernel (tinykernels.py), torch: the slow reference")
     ap.add_argument("--no-triton-kernels", action="store_true",
                     help="use the plain torch ops instead of the fused Triton RMSNorm / RoPE / SwiGLU / MoE kernels")
+    ap.add_argument("--no-p2p-all-reduce", action="store_true", 
+                     help="-tp>1: use NCCL's all-reduce instead of ours")
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--max-num-seqs", type=int, default=256)
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
@@ -2905,15 +3128,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
-    cfg = Config(model=a.model, attention_backend=a.attention_backend,
+    cfg = Config(model=a.model, 
+                 attention_backend=a.attention_backend,
                  use_triton_kernels=not a.no_triton_kernels,
-                 max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
+                 max_model_len=a.max_model_len, 
+                 max_num_seqs=a.max_num_seqs,
                  max_num_batched_tokens=a.max_num_batched_tokens,
                  gpu_memory_utilization=a.gpu_memory_utilization,
                  use_cuda_graphs=not a.no_cuda_graphs,
                  enable_prefix_caching=not a.no_prefix_caching,
                  tensor_parallel_size=a.tensor_parallel_size,
-                 expert_parallel=a.expert_parallel)
+                 expert_parallel=a.expert_parallel,
+                 p2p_all_reduce=not a.no_p2p_all_reduce)
     engine = Engine(cfg)
     if a.command == "generate":
         out = engine.generate([a.prompt], SamplingParams(temperature=a.temperature,
