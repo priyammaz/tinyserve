@@ -1,5 +1,5 @@
 # tinyserve
-<img src="banner.png" alt="img" width="700"/>
+<img src="imgs/banner.png" alt="img" width="700"/>
 
 LLM inference is all the rage these days! Whether it is user-side inference or rollout generation for RL post-training, being able to serve LLMs fast matters. tinyserve is a small, readable, vLLM-style inference engine: the whole scheduler, KV cache, model, tensor parallelism and HTTP server live in one file, `serve.py`, and the GPU kernels live in a second one, `tinykernels.py`.
 
@@ -14,6 +14,15 @@ It is meant to be read. `serve.py` is written as a plain PyTorch reference with 
 - An **OpenAI-Compatible HTTP Server** (`/v1/completions`, `/v1/chat/completions`) with streaming
 
 Models: Llama-style architectures (`llama`, `qwen2`, `qwen3`) and `qwen3_moe`. Tested on Qwen3-0.6B, 8B, 32B and Qwen3-30B-A3B; other Llama-class models should work but have not been tried yet.
+
+### Let's Build It Together
+
+| Project | Summary | Source Code | Video |
+|---|---|---|---|
+| `The Annotated LLM Server` | LLM serving fundamentals, KV caching, batching, scheduling | — | [Video](https://youtu.be/SzArjwEkvKI) |
+| `tinyserve 1.0` | Paged KV Cache, Prefix Caching, Continuous Batching, Chunked Prefill, CUDA Graphs | [Code](https://github.com/priyammaz/tinyserve/tree/tinyserve-1.0) | [Video](https://youtu.be/qIVzHM2FfFY) |
+| `tinyserve 2.0` | Triton Kernels, Split-KV, Tensor/Expert Parallelism, MoE, Async Scheduling, CUDA Graphs | [Code](https://github.com/priyammaz/tinyserve/tree/tinyserve-2.0) | [Video](https://youtu.be/1demEePpFXU) |
+| `tinyserve 2.1` | Faster All-Reduce, MoE Optimization, Fused Comms | [Code](https://github.com/priyammaz/tinyserve/tree/tinyserve-2.1) | — |
 
 ## Install
 
