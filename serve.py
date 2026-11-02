@@ -1199,7 +1199,10 @@ class Model(nn.Module):
         super().__init__()
 
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+
+        # Under tensor parallel, each GPU only stores its slice of the embedding table
+        # just like lm_head later. We can split and then all reduce after
+        self.embed_tokens = nn.Embedding(-(-cfg.vocab_size // TP_SIZE), cfg.hidden_size)
 
         self.layers = nn.ModuleList(DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
@@ -1224,9 +1227,32 @@ class Model(nn.Module):
         self.register_buffer("cos", freqs.cos().float(), persistent=False)
         self.register_buffer("sin", freqs.sin().float(), persistent=False)
 
+    def embed(self, input_ids):
+        """
+        With Tensor Parallel no GPU has the whole table, so each one looks up
+        the tokens in its own slice and leaves zero everywhere else. The all-reduce
+        then adds them up to get the full embedding everywhere. This mainly saves
+        some per-gpu memory as each doesn't need to store the full table
+        """
+
+        if TP_SIZE == 1:
+            return self.embed_tokens(input_ids)
+
+        # the token ids this gpu holds are from lo to lo + n
+        n = self.embed_tokens.num_embeddings
+        lo = TP_RANK * n
+        mine = (input_ids >= lo) & (input_ids < lo + n)
+
+        # offset to start at 0 (clamp just keeps the other gpus indexes in bound)
+        # but of course they will be garbage data so we multiply by the mask, 
+        # zeroing out all the positions this GPU is not responsible for
+        x = self.embed_tokens((input_ids - lo).clamp(0, n-1)) * mine.unsqueeze(-1)
+
+        return tp_all_reduce(x)
+
     def forward(self, input_ids, positions):
         cos, sin = self.cos[positions], self.sin[positions]
-        x, residual = self.embed_tokens(input_ids), None
+        x, residual = self.embed(input_ids), None
         for layer in self.layers:
             x, residual = layer(x, residual, cos, sin)
         return add_rmsnorm(self.norm, x, residual)[0]     # the last residual add + final norm
@@ -1241,13 +1267,10 @@ class Model(nn.Module):
         V = self.cfg.vocab_size
         n = -(-V//TP_SIZE) # ceiling div
 
-        ### if weights are tied, the embedding is whole on every GPU (no parallelism on the 
-        ### embedding matrix as its simple lookup), so slice the piece we need and forwrd
+        ### If weights are tied, this is easy, this GPU already only contains this slice of 
+        ### the vocabularize size, so just multiply and move on!
         if self.tie:
-            part = hidden @ self.embed_tokens.weight[TP_RANK * n:(TP_RANK + 1) * n].t()
-
-            if part.shape[1] < n:   # last rank, vocabulary that doesn't divide evenly: pad to n like lm_head
-                part = F.pad(part, (0, n - part.shape[1]))
+            part = hidden @ self.embed_tokens.weight.t()
 
         ### If the LM Head doesnt share weights then those weights have been split, and
         ### if our goal is the final [T x V], each gpu has a portion of those V (zeroed out)
@@ -1343,6 +1366,16 @@ def load_model(name,
             lo, hi = tp_rank * n, min((tp_rank + 1) * n, sl.get_shape()[0])
             model.lm_head.weight.zero_()
             assign("lm_head", "weight", sl[lo:hi], rows=slice(0, hi - lo))
+
+        ### Embeddings can also be split up
+        elif tp_size > 1 and (name_ == "embed_tokens.weight" or (name_ == "lm_head.weight" and not model.tie)):
+            module = name_.removesuffix(".weight")
+            weight = model.get_submodule(module).weight
+            sl = fh.get_slice(key)
+            n = weight.shape[0]
+            lo, hi = tp_rank * n, min((tp_rank + 1) * n, sl.get_shape()[0])
+            weight.zero_()
+            assign(module, "weight", sl[lo:hi], rows=slice(0, hi - lo))
 
         # everything else: a parameter with the same name (norms, embedding, o_proj, ...)
         elif name_ in params:
